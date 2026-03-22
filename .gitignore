@@ -1,1 +1,47 @@
+# Checkpoints and model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Training artifacts
+logs/
+profiler_output/
+wandb/
+
+# Data (too large for git)
+*_samples*/
+training_samples/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ONNX / LC0 caches
+*.onnx
+lc0_cache/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
 game.pgn

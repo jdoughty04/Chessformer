@@ -1,0 +1,313 @@
+# =============================================================================
+# Chess Fusion Training Configuration
+#
+# This config controls the full pipeline: data loading, model architecture,
+# training loop, and profiling. See docs/training.md for a walkthrough.
+# =============================================================================
+
+# --- Training Loop -----------------------------------------------------------
+training:
+  experiment_name: "chess_fusion_lm"
+  output_dir: "checkpoints/chess_fusion"
+
+  # Path to .pt sample directory exported by Synthetic_commentary_generation
+  # via `chess_commentary dataset-export`.
+  samples_dir: "training_samples"
+
+  # Uncomment to resume from a previous checkpoint:
+  # resume_from_checkpoint: "checkpoints/chess_fusion"
+
+  # Optional secondary dataset for grounding retention during fine-tuning.
+  # Mixes second dataset into each epoch.
+  # secondary_samples_dir: "grounding_samples"
+  # secondary_mix_ratio: 0.10 (as percentage of primary dataset size)
+  # secondary_mix_seed: 42
+
+  num_epochs: 10
+  batch_size: 32                    # per-device batch size
+  gradient_accumulation_steps: 2    # effective batch = batch_size * accumulation
+  learning_rate: 1.0e-4
+  gradient_clip_val: null           # null = no clipping
+  warmup_ratio: 0.015              # fraction of total steps for LR warmup
+  epoch_warmup_ratio: 0.005        # additional per-epoch warmup
+  max_length: 512                  # max token sequence length
+  val_split: 0.025                 # fraction of data held out for validation
+
+  # Prompt construction: what context the model sees alongside the position
+  prepend_fen_in_prompt: false     # include raw FEN string in the text prompt
+  use_pgn_in_prompt: true          # include recent move history
+  pgn_prompt_last_n_moves: 5      # how many moves of history to include
+
+  # Chess token weighting: upweight loss on chess-relevant tokens to improve
+  # grounding. Set chess_token_weight_enabled: false to use uniform weighting.
+  chess_token_weight_enabled: true
+  chess_token_weight_squares: 3.0  # square names (e1, d4, ...)
+  chess_token_weight_pieces: 2.0   # piece names (knight, bishop, ...)
+  chess_token_weight_moves: 2.5    # move notation (Nf3, Bxe5, ...)
+  chess_token_weight_sides: 1.5    # "white", "black"
+  chess_token_weight_files: 1.5    # file names (a-file, kingside, ...)
+
+  # Precision and optimization
+  bf16: true
+  gradient_checkpointing: false
+  use_8bit_optimizer: true         # AdamW 8-bit (bitsandbytes)
+  preload_dataset: false           # load full dataset into memory
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 4
+  dataloader_persistent_workers: true
+
+  # Checkpointing and logging
+  save_steps: 500
+  logging_steps: 1
+  max_steps_per_epoch: 100000
+  use_wandb: true
+  wandb_project: "chess-commentary"
+
+  # Validation generation: sample model outputs during training
+  log_val_generations: true
+  val_generation_samples: 2
+  val_generation_max_new_tokens: 512
+  val_generation_temperature: 0.7
+  val_generation_log_path: "logs/val_generations.txt"
+  val_generation_log_wandb: true
+
+  # Live control server: allows freeze/unfreeze toggling during training
+  # without restarting. Connect via HTTP on this port.
+  control_port: 8585
+  control_poll_steps: 2
+
+# --- Model -------------------------------------------------------------------
+model:
+  base_model: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+  load_in_8bit: false
+  load_in_4bit: false
+  bnb_4bit_compute_dtype: bf16
+  use_flash_attention: true
+  use_torch_compile: true
+  use_lora: true
+  mode: "chess_fusion"
+
+  # Set to false for adapter-only pretraining (chess objectives only, no LM).
+  # The training loop will automatically use PolicyOnlyModel.
+  enable_lm: true
+
+  # Load a previously saved LM checkpoint (separate from adapter checkpoint).
+  load_lm_checkpoint: false
+
+  chess_fusion:
+    # --- Checkpoint loading ---------------------------------------------------
+    # Selectively load components from a saved adapter checkpoint.
+    # Useful for progressive training: e.g., load a pretrained encoder,
+    # then train only the cross-attention and LoRA layers.
+    load_checkpoint_backbone: false
+    load_checkpoint_csmp: true
+    load_checkpoint_perceiver: true
+    load_checkpoint_xattn: false
+    load_checkpoint_prepend_latents: true
+    load_checkpoint_lm_pseudotokens: false
+    load_checkpoint_aux_heads: true
+
+    # --- Front End: Board Encoding --------------------------------------------
+    # Board-only mode builds square tokens from learned embeddings.
+    # The CNN path (use_cnn: true) uses a pretrained Maia backbone instead —
+    # leave disabled unless you have Maia weights and want to experiment.
+    use_cnn: false
+    cnn_tap_layers: []
+    tap_projection_dim: 1024
+    use_transformer_taps: false
+
+    # --- CSMP: Chess Structure Message Passing --------------------------------
+    # Sparse multi-head attention over 64 squares using chess relation masks
+    # (files, ranks, diagonals, knight moves, sliding rays, attacks).
+    use_chess_structure_mp: true
+    csmp_layers: 8                 # number of CSMP transformer layers
+    csmp_heads: 8                  # attention heads (each assigned to a relation type)
+    csmp_dim: 1024                 # hidden dimension
+    csmp_pos_dim: 512              # positional embedding dimension
+    csmp_piece_dim: 256            # piece embedding dimension
+    csmp_ffn_mult: 4               # FFN expansion factor
+    csmp_dropout: 0.2
+
+    # Dynamic masks: ray masks use occupancy-aware sliding; attack masks
+    # use piece-type-aware attack patterns. Both recommended.
+    csmp_use_ray_mask: true
+    csmp_use_attack_mask: true
+    csmp_use_xy_coords: true
+
+    # Relative position mode for CSMP attention:
+    #   none            - masks only, content-driven routing (simplest)
+    #   score_bias      - learned (head, delta_rank, delta_file) bias on attention scores
+    #   edge_modulation - learned edge embeddings modulate keys AND values (most expressive)
+    csmp_relative_mode: none
+    csmp_relative_edge_dim: 16     # edge embedding dim (only used with edge_modulation)
+    csmp_ablation_no_mask: false   # set true to ablate all chess masks (for comparison)
+
+    use_absolute_coords: true
+
+    # --- Perceiver: Structured Latent Bottleneck ------------------------------
+    # 65 latents = 64 square-aligned + 1 global. Each square latent reads
+    # primarily its own square token; the global latent aggregates everything.
+    structured_latents: true
+    num_latents: 65
+    perceiver_depth: 4             # number of Perceiver blocks
+    perceiver_dim: 1024
+    perceiver_heads: 16
+    perceiver_dropout: 0.2
+    use_engineered_concat: false
+
+    # Masking: strict_own_square forces each square latent to attend only to
+    # its corresponding square token + side-to-move, preserving square identity.
+    latent_context_mask_type: strict_own_square
+    global_latent_attends_all: true
+    square_latent_attends_side_token: true
+    square_heads_include_global_latent: true
+
+    # Shared policy core: produces 64 policy latents from Perceiver output.
+    # These are the common representation for all auxiliary heads AND LLM fusion.
+    use_structured_policy_head: true
+    structured_policy_query_layers: 2
+    structured_policy_query_heads: 16
+    structured_policy_ffn_mult: 2
+    structured_policy_use_move_bias: true
+
+    # Legacy shared readout (kept for checkpoint compatibility, not actively used
+    # by structured_square_mixer mode).
+    num_fusion_tokens: 16
+    readout_depth: 2
+    shared_readout_fourier_dim: 64
+    readout_use_policy_latent_cross_attention: true
+
+    # --- Decoder Fusion -------------------------------------------------------
+    # Which LLM decoder layers receive chess cross-attention.
+    # More layers = richer fusion but more parameters. A spread across the
+    # network (early + late) lets the model use chess context at different
+    # abstraction levels.
+    xattn_layers: [0, 4, 7, 11, 15, 18, 21]
+
+    # Fusion mode: structured_square_mixer routes each text token to 64x3
+    # aligned slots (CSMP, Perceiver, Policy per square). See
+    # docs/structured_square_mixer_math.md for the exact equations.
+    xattn_mode: structured_square_mixer
+    xattn_heads: 16
+    xattn_gate_init: 0.0           # initial gate value (0 = start with no chess signal)
+    xattn_dropout: 0.1
+    xattn_ffn_mult: 4
+
+    # Recurrent query parameters (used internally by the structured mixer
+    # to build per-token query states via GRU).
+    xattn_recurrent_query_state_dim: 1024
+    xattn_recurrent_query_use_mlp: true
+    xattn_recurrent_query_share_gru_across_layers: true
+
+    # Prepended chess latents: project chess latents into the LLM embedding
+    # space and prepend them as prefix tokens before the text.
+    enable_lm_prepend_latents: true
+    num_lm_prepend_latents: 64
+    lm_prepend_latent_mode: structured_mlp
+    lm_prepend_latents_use_positional_encoding: true
+
+    # Layer pseudotokens: per-layer learned KV pairs added to the attention
+    # context at specified decoder layers. A lightweight way to inject
+    # layer-specific learned context.
+    enable_lm_pseudotokens: false
+    num_lm_pseudotokens: 4
+    lm_pseudotoken_layers: [0, 4, 7, 11, 15, 18, 21]
+
+    # --- Auxiliary Objectives -------------------------------------------------
+
+    # Policy distillation: match precomputed Maia move probabilities.
+    aux_policy_weight: 1.0
+    use_precomputed_policy: true   # use cached maia_policy from .pt files
+
+    # Deprecated position-bucket eval classifier (disabled, kept for compat).
+    aux_eval_weight: 0.0
+    num_eval_buckets: 5
+
+    # Router regularization (structured square mixer only):
+    # Sparsity encourages each text token to focus on few squares.
+    # Diversity prevents all tokens from collapsing to the same squares.
+    structured_xattn_sparse_weight: 1.0
+    structured_xattn_square_diversity_weight: 1.0
+    structured_xattn_square_diversity_target_entropy: 1.0
+
+    # Move evaluation objective: ranks and scores candidate moves using
+    # engine evaluations from the training data. Requires move_evals in .pt files.
+    aux_move_eval_weight: 0.1      # set to 0 to disable
+    move_eval_dim: 1024
+    move_eval_cp_scale: 512.0      # normalize centipawn targets
+    move_eval_cp_clip: 2000.0      # clip extreme values for stability
+    move_eval_mse_weight: 1.0      # MSE regression balance
+    move_eval_ce_weight: 0.1       # soft CE balance
+    move_eval_pairwise_weight: 1.0 # pairwise ranking balance
+    move_eval_pairwise_topk: 5
+    move_eval_pairwise_cp_margin: 10.0
+    move_eval_pairwise_temperature: 1.0
+    move_eval_mate_weight: 1.0     # mate classification balance
+    move_eval_mate_threshold_cp: 9000.0
+    move_eval_ce_topk: 5
+    move_eval_ce_cp_temperature: 128.0
+
+    # Board State Reconstruction: predict piece identity per square.
+    bsr_weight: 0.5
+    bsr_dim: 256
+    bsr_heads: 4
+    bsr_layers: 1
+    bsr_dropout: 0.75
+
+    # Square Property Prediction: predict attack counts and ray distances.
+    spp_weight: 0.5
+    spp_dim: 256
+    spp_heads: 4
+    spp_layers: 1
+    spp_dropout: 0.75
+
+    # --- Freeze / Unfreeze Schedule -------------------------------------------
+    # Control which components are trainable. Useful for staged training:
+    # e.g., first train encoder with chess objectives, then unfreeze LLM layers.
+    freeze_cnn: true
+    freeze_transformer: true
+    freeze_csmp: true
+    freeze_perceiver: true
+    freeze_xattn: false
+    freeze_prepend_latents: false
+    freeze_lm_pseudotokens: true
+
+    # Per-component learning rate multipliers (relative to base LR).
+    cnn_learning_rate: 0.01
+    perceiver_lr_ratio: 1
+    csmp_lr_ratio: 1
+    xattn_lr_ratio: 0.5
+    prepend_latent_lr_ratio: 0.5
+    pseudotoken_lr_ratio: 1.0
+    lora_lr_ratio: 1.0
+
+    # --- LoRA -----------------------------------------------------------------
+    lora:
+      r: 32                        # rank
+      alpha: 64                    # scaling factor
+      dropout: 0.05
+      start_frozen: true           # start LoRA frozen, unfreeze later
+      unfreeze_epoch: 0            # epoch at which to unfreeze LoRA
+      progressive_merge: false
+      target_modules: "auto"       # auto-detects based on model architecture
+
+# --- Profiling ---------------------------------------------------------------
+# Performance monitoring tools. All sub-options are no-ops when enabled: false.
+profiling:
+  enabled: false                   # set true to activate profiling
+  nvtx_ranges: false
+  cuda_event_timing: false         # more accurate than wall-clock under async GPU
+  csmp_timing: false               # per-CSMP-layer timing (adds sync overhead)
+  torch_profiler: false            # export chrome trace for operator-level analysis
+  torch_profiler_wait: 15
+  torch_profiler_warmup: 15
+  torch_profiler_active: 30
+  torch_profiler_output_dir: "profiler_output"
+  memory_snapshots: false          # log peak GPU memory to wandb
+  log_to_wandb: true
+  emit_interval: 50                # profiling metrics every N steps (0 = follow logging_steps)
+
+  # GPU peak TFLOPs for MFU calculation. Update for your hardware:
+  # RTX 3090 (bf16): 35.6 | RTX 4090 (bf16): 82.6 | A100 SXM (bf16): 312
+  gpu_peak_tflops: 35.6
