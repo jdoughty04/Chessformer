@@ -2256,6 +2256,8 @@ class GatedCrossAttention(nn.Module):
         self._last_structured_metrics: Optional[Dict[str, torch.Tensor]] = None
         self._last_structured_square_sparse_loss: Optional[torch.Tensor] = None
         self._last_structured_square_usage_entropy_norm: Optional[torch.Tensor] = None
+        self._capture_last_token_trace: bool = False
+        self._last_token_trace: Optional[Dict[str, torch.Tensor]] = None
 
         # --- FFN ---
         self.ffn_norm = nn.LayerNorm(llm_dim)
@@ -2349,6 +2351,14 @@ class GatedCrossAttention(nn.Module):
             dropout_p=self.attn_dropout.p if self.training else 0.0,
         )
 
+    def set_last_token_trace_capture(self, enabled: bool) -> None:
+        self._capture_last_token_trace = bool(enabled)
+        if not self._capture_last_token_trace:
+            self._last_token_trace = None
+
+    def clear_last_token_trace(self) -> None:
+        self._last_token_trace = None
+
     def _cache_structured_metrics(
         self,
         slot_weights: torch.Tensor,
@@ -2407,6 +2417,44 @@ class GatedCrossAttention(nn.Module):
             "global_entropy": global_entropy.detach(),
         }
 
+    def _cache_last_token_trace(
+        self,
+        slot_weights: torch.Tensor,
+        global_weights: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor],
+    ) -> None:
+        if not self._capture_last_token_trace:
+            self._last_token_trace = None
+            return
+
+        batch_size, seq_len, _ = slot_weights.shape
+        if seq_len <= 0:
+            self._last_token_trace = None
+            return
+
+        valid = self._build_valid_token_mask(
+            text_attention_mask,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=slot_weights.device,
+        )
+        valid_counts = valid.long().sum(dim=1)
+        last_token_indices = (valid_counts - 1).clamp(min=0, max=seq_len - 1)
+        batch_indices = torch.arange(batch_size, device=slot_weights.device)
+
+        raw_slot_weights = slot_weights[batch_indices, last_token_indices].detach()
+        global_token_weights = global_weights[batch_indices, last_token_indices].detach()
+        source_square_weights = raw_slot_weights.view(batch_size, 3, 64)
+        aggregate_square_weights = source_square_weights.sum(dim=1)
+
+        self._last_token_trace = {
+            "raw_slot_weights": raw_slot_weights,
+            "source_square_weights": source_square_weights,
+            "aggregate_square_weights": aggregate_square_weights,
+            "global_weights": global_token_weights,
+            "last_token_indices": last_token_indices.detach(),
+        }
+
     def _forward_recurrent_query_mode(
         self,
         hidden_states: torch.Tensor,
@@ -2416,6 +2464,7 @@ class GatedCrossAttention(nn.Module):
         policy_latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Direct recurrent-query xattn over policy/perceiver/csmp sources."""
+        self._last_token_trace = None
         B, S, _ = hidden_states.shape
 
         rq_in = self.recurrent_query_norm(hidden_states)
@@ -2503,6 +2552,7 @@ class GatedCrossAttention(nn.Module):
         self._last_structured_metrics = None
         self._last_structured_square_sparse_loss = None
         self._last_structured_square_usage_entropy_norm = None
+        self._last_token_trace = None
         self._require_rank3("perceiver_latents", perceiver_latents)
         if perceiver_latents.size(1) < 65:
             raise ValueError(
@@ -2562,6 +2612,11 @@ class GatedCrossAttention(nn.Module):
         global_mix = torch.einsum("bsg,bgd->bsd", global_weights, global_values)
 
         self._cache_structured_metrics(
+            slot_weights=square_weights.float(),
+            global_weights=global_weights.float(),
+            text_attention_mask=text_attention_mask,
+        )
+        self._cache_last_token_trace(
             slot_weights=square_weights.float(),
             global_weights=global_weights.float(),
             text_attention_mask=text_attention_mask,
@@ -3628,6 +3683,14 @@ class ChessFusionAdapter(nn.Module):
         for layer in self._fusion_layers:
             layer.clear_chess_context()
 
+    def set_last_token_trace_capture(self, enabled: bool) -> None:
+        for xattn in self.gated_xattns:
+            xattn.set_last_token_trace_capture(enabled)
+
+    def clear_last_token_traces(self) -> None:
+        for xattn in self.gated_xattns:
+            xattn.clear_last_token_trace()
+
     # â”€â”€ Main Interface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_num_prefix_tokens(self) -> int:
@@ -3771,6 +3834,43 @@ class ChessFusionAdapter(nn.Module):
                 metrics[f"structured_xattn/layer_{idx}/global_mass/{global_name}"] = global_mean[global_idx].item()
 
         return metrics
+
+    @torch.no_grad()
+    def get_last_token_structured_traces(
+        self,
+        sample_index: int = 0,
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
+        traces: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        for i, idx in enumerate(self.xattn_layer_indices):
+            xattn = self.gated_xattns[i]
+            trace = getattr(xattn, "_last_token_trace", None)
+            if xattn.xattn_mode != "structured_square_mixer" or trace is None:
+                continue
+
+            batch_size = int(trace["raw_slot_weights"].size(0))
+            if sample_index < 0 or sample_index >= batch_size:
+                raise IndexError(
+                    f"sample_index {sample_index} out of range for trace batch size {batch_size}"
+                )
+
+            source_square_weights = (
+                trace["source_square_weights"][sample_index].detach().float().cpu()
+            )
+            traces[idx] = {
+                "raw_slot_weights": trace["raw_slot_weights"][sample_index].detach().float().cpu(),
+                "source_square_weights": source_square_weights,
+                "aggregate_square_weights": (
+                    trace["aggregate_square_weights"][sample_index].detach().float().cpu()
+                ),
+                "global_weights": trace["global_weights"][sample_index].detach().float().cpu(),
+                "last_token_index": trace["last_token_indices"][sample_index].detach().cpu(),
+                "csmp_square_weights": source_square_weights[0].clone(),
+                "perceiver_square_weights": source_square_weights[1].clone(),
+                "policy_square_weights": source_square_weights[2].clone(),
+            }
+
+        return traces
 
     def compute_structured_xattn_sparse_loss(self, device: torch.device) -> torch.Tensor:
         losses: List[torch.Tensor] = []

@@ -278,6 +278,101 @@ def test_structured_square_mixer_metrics_have_expected_shapes_and_normalization(
     torch.testing.assert_close(metrics["global_mean"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
 
 
+def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalization():
+    inputs = _make_inputs(batch_size=2, seq_len=4)
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+    )
+    xattn.set_last_token_trace_capture(True)
+
+    xattn(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+    )
+
+    trace = xattn._last_token_trace
+    assert trace is not None
+    assert trace["raw_slot_weights"].shape == (2, 192)
+    assert trace["source_square_weights"].shape == (2, 3, 64)
+    assert trace["aggregate_square_weights"].shape == (2, 64)
+    assert trace["global_weights"].shape == (2, 2)
+    torch.testing.assert_close(
+        trace["raw_slot_weights"].sum(dim=-1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["aggregate_square_weights"].sum(dim=-1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["global_weights"].sum(dim=-1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["source_square_weights"],
+        trace["raw_slot_weights"].view(2, 3, 64),
+        atol=1e-5,
+        rtol=0.0,
+    )
+
+
+def test_structured_square_mixer_last_token_trace_uses_last_valid_token():
+    inputs = _make_inputs(batch_size=1, seq_len=4)
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+    )
+    xattn.set_last_token_trace_capture(True)
+    text_attention_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.long)
+
+    xattn(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=text_attention_mask,
+        policy_latents=inputs["policy_latents"],
+    )
+
+    trace = xattn._last_token_trace
+    assert trace is not None
+    assert int(trace["last_token_indices"][0].item()) == 1
+
+    rq_state = xattn._last_recurrent_query_state
+    assert rq_state is not None
+    global_perceiver_cond = inputs["perceiver_latents"][:, 64, :].unsqueeze(1).expand(-1, 4, -1)
+    square_weight_inputs = torch.cat([rq_state, global_perceiver_cond], dim=-1)
+    all_square_weights = torch.softmax(
+        xattn.structured_square_weight_proj(square_weight_inputs).float(),
+        dim=-1,
+    )
+    torch.testing.assert_close(
+        trace["raw_slot_weights"][0],
+        all_square_weights[0, 1],
+        atol=1e-5,
+        rtol=0.0,
+    )
+
+
 def test_structured_square_mixer_square_weights_condition_on_global_perceiver_latent():
     inputs = _make_inputs(batch_size=1, seq_len=3)
     xattn = GatedCrossAttention(

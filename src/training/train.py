@@ -21,7 +21,7 @@ import os
 import sys
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 import torch
@@ -1141,7 +1141,219 @@ class ChessCommentaryModel(nn.Module):
             self._fusion_move_ce_mask = None
         
         return outputs
-    
+
+    def _build_generation_prompt_inputs(self, prompt: str) -> tuple[str, dict[str, torch.Tensor]]:
+        messages = [{"role": "user", "content": prompt}]
+        prompt_text = _safe_apply_chat_template(
+            self.tokenizer, messages, add_generation_prompt=True
+        )
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,
+        )
+        return prompt_text, inputs
+
+    def _prepare_generation_position_state(
+        self,
+        lc0_hidden_states: Optional[dict[str, torch.Tensor]],
+        side_to_move: bool = True,
+        fen: Optional[str] = None,
+        maia_policy: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        device = next(self.llm.parameters()).device
+        batch_size = 1
+        generation_context: Optional[Dict[str, Optional[torch.Tensor]]] = None
+
+        if self.config.mode == "hybrid":
+            if fen is None:
+                raise ValueError("FEN is required for hybrid features mode")
+            feat_mode = getattr(self.config, "engineered_features_type", "simplified")
+            features = extract_engineered_features(fen, mode=feat_mode).unsqueeze(0).to(device)
+            lc0_states = {
+                k: v.unsqueeze(0).to(device) if v.dim() == 2 else v.to(device)
+                for k, v in lc0_hidden_states.items()
+            }
+            side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
+            position_embeds = self.adapter(lc0_states, features, side_to_move=side_tensor)
+        elif self.config.mode == "engineered":
+            if fen is None:
+                raise ValueError("FEN is required for engineered features mode")
+            feat_mode = getattr(self.config, "engineered_features_type", "simplified")
+            features = extract_engineered_features(fen, mode=feat_mode).unsqueeze(0).to(device)
+            side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
+            position_embeds = self.adapter(features, side_to_move=side_tensor)
+        elif self.config.mode == "maia":
+            if fen is None:
+                raise ValueError("FEN is required for maia features mode")
+            features = extract_maia_features(fen).unsqueeze(0).to(device)
+            side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
+            if getattr(self.config.maia, "use_main_engineered_concat", False):
+                engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
+                position_embeds = self.adapter(
+                    features,
+                    side_to_move=side_tensor,
+                    engineered_features=engineered,
+                )
+            else:
+                position_embeds = self.adapter(features, side_to_move=side_tensor)
+        elif self.config.mode == "chess_fusion":
+            if fen is None:
+                raise ValueError("FEN is required for chess_fusion mode")
+            features = extract_maia_features(fen).unsqueeze(0).to(device)
+            side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
+            fusion_kwargs = {"side_to_move": side_tensor}
+            if maia_policy is not None:
+                fusion_kwargs["precomputed_policy"] = maia_policy.to(device)
+            if getattr(self.config.chess_fusion, "use_engineered_concat", False):
+                engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
+                fusion_kwargs["engineered_features"] = engineered
+            adapter_out = self.adapter(features, **fusion_kwargs)
+            self._last_adapter_out = adapter_out
+            perceiver_latents = adapter_out["perceiver_latents"]
+            policy_latents = adapter_out.get("policy_latents", None)
+            ctx = adapter_out.get("context", None)
+            if ctx is not None:
+                ctx = ctx.to(dtype=self.torch_dtype)
+            csmp_square_tokens = adapter_out.get("csmp_square_tokens", None)
+            if csmp_square_tokens is not None:
+                csmp_square_tokens = csmp_square_tokens.to(dtype=self.torch_dtype)
+            if policy_latents is not None:
+                policy_latents = policy_latents.to(dtype=self.torch_dtype)
+            generation_context = {
+                "perceiver_latents": perceiver_latents.to(dtype=self.torch_dtype),
+                "context": ctx,
+                "csmp_square_tokens": csmp_square_tokens,
+                "policy_latents": policy_latents,
+            }
+            prepend_embeddings = adapter_out.get("prepend_embeddings", None)
+            if prepend_embeddings is not None:
+                if prepend_embeddings.size(1) != self.num_prefix_tokens:
+                    raise ValueError(
+                        "Mismatch between adapter prefix token count and model expectation: "
+                        f"{prepend_embeddings.size(1)} vs {self.num_prefix_tokens}"
+                    )
+                position_embeds = prepend_embeddings
+            else:
+                position_embeds = perceiver_latents.new_zeros(
+                    batch_size, 0, self.llm.config.hidden_size
+                )
+        else:
+            raise ValueError(f"Unknown mode: {self.config.mode}")
+
+        return {
+            "position_embeds": position_embeds,
+            "generation_context": generation_context,
+        }
+
+    def _build_generation_model_inputs(
+        self,
+        position_embeds: torch.Tensor,
+        prompt_inputs: dict[str, torch.Tensor],
+        fen: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        device = next(self.llm.parameters()).device
+        input_ids = prompt_inputs["input_ids"].to(device)
+        attention_mask = prompt_inputs["attention_mask"].to(device)
+        batch_size = int(input_ids.size(0))
+
+        token_embeds = self.llm.get_input_embeddings()(input_ids)
+        position_embeds = position_embeds.to(
+            device=token_embeds.device,
+            dtype=token_embeds.dtype,
+        )
+
+        if self.use_fen_tokens and fen is not None:
+            fen_encodings = self.tokenizer(
+                [fen],
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors="pt",
+            )
+            fen_ids = fen_encodings["input_ids"].to(device)
+            fen_mask = fen_encodings["attention_mask"].to(device)
+            fen_embeds = self.llm.get_input_embeddings()(fen_ids)
+            fen_len = int(fen_ids.shape[1])
+        else:
+            fen_embeds = None
+            fen_mask = None
+            fen_len = 0
+
+        if fen_embeds is not None:
+            combined_embeds = torch.cat([position_embeds, fen_embeds, token_embeds], dim=1)
+        else:
+            combined_embeds = torch.cat([position_embeds, token_embeds], dim=1)
+
+        prefix_mask = torch.ones(
+            (batch_size, self.num_prefix_tokens),
+            dtype=attention_mask.dtype,
+            device=device,
+        )
+        if fen_len > 0 and fen_mask is not None:
+            combined_mask = torch.cat([prefix_mask, fen_mask, attention_mask], dim=1)
+        else:
+            combined_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+
+        position_ids = self._build_position_ids(
+            combined_mask,
+            prefix_len=self.num_prefix_tokens,
+        )
+
+        return {
+            "prompt_input_ids": input_ids,
+            "prompt_attention_mask": attention_mask,
+            "combined_embeds": combined_embeds,
+            "combined_mask": combined_mask,
+            "position_ids": position_ids,
+        }
+
+    def prepare_generation_inputs(
+        self,
+        lc0_hidden_states: Optional[dict[str, torch.Tensor]],
+        side_to_move: bool = True,
+        prompt: str = "Provide commentary.",
+        fen: Optional[str] = None,
+        maia_policy: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        prompt_text, prompt_inputs = self._build_generation_prompt_inputs(prompt)
+        position_state = self._prepare_generation_position_state(
+            lc0_hidden_states=lc0_hidden_states,
+            side_to_move=side_to_move,
+            fen=fen,
+            maia_policy=maia_policy,
+        )
+        model_inputs = self._build_generation_model_inputs(
+            position_embeds=position_state["position_embeds"],
+            prompt_inputs=prompt_inputs,
+            fen=fen,
+        )
+        return {
+            "prompt_text": prompt_text,
+            "generation_context": position_state["generation_context"],
+            **model_inputs,
+        }
+
+    def set_generation_context(
+        self,
+        generation_context: Optional[Dict[str, Optional[torch.Tensor]]],
+        text_attention_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.config.mode != "chess_fusion" or generation_context is None:
+            return
+
+        self.adapter.set_chess_context(
+            generation_context["perceiver_latents"],
+            generation_context.get("context"),
+            csmp_square_tokens=generation_context.get("csmp_square_tokens"),
+            text_attention_mask=text_attention_mask,
+            policy_latents=generation_context.get("policy_latents"),
+        )
+
+    def clear_generation_context(self) -> None:
+        if self.config.mode == "chess_fusion":
+            self.adapter.clear_chess_context()
+
     def generate(
         self,
         lc0_hidden_states: dict[str, torch.Tensor],
@@ -1170,168 +1382,39 @@ class ChessCommentaryModel(nn.Module):
             Generated commentary string
         """
         self.eval()
-        
-        with torch.inference_mode():
-            # Prepare prompt using chat template (with fallback for models without one)
-            messages = [{"role": "user", "content": prompt}]
-            prompt_text = _safe_apply_chat_template(
-                self.tokenizer, messages, add_generation_prompt=True
-            )
-            
-            # Tokenize prompt
-            inputs = self.tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                padding=True,
-            )
-            
-            device = next(self.llm.parameters()).device
-            input_ids = inputs["input_ids"].to(device)
-            attention_mask = inputs["attention_mask"].to(device)
-            
-            # Get embeddings
-            batch_size = 1
-            if self.config.mode == "hybrid":
-                # Hybrid adapter takes both LC0 states and engineered features
-                if fen is None:
-                    raise ValueError("FEN is required for hybrid features mode")
-                # Use configured feature type (main vs simplified)
-                feat_mode = getattr(self.config, "engineered_features_type", "simplified")
-                features = extract_engineered_features(fen, mode=feat_mode).unsqueeze(0).to(device)  # (1, 64, 204)
-                lc0_states = {k: v.unsqueeze(0).to(device) if v.dim() == 2 else v.to(device) 
-                              for k, v in lc0_hidden_states.items()}
-                side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
-                position_embeds = self.adapter(lc0_states, features, side_to_move=side_tensor)
-            elif self.config.mode == "engineered":
-                # Engineered adapter takes feature tensor - extract on-the-fly for inference
-                if fen is None:
-                    raise ValueError("FEN is required for engineered features mode")
-                # Use configured feature type (main vs simplified)
-                feat_mode = getattr(self.config, "engineered_features_type", "simplified")
-                features = extract_engineered_features(fen, mode=feat_mode).unsqueeze(0).to(device)  # (1, 64, 204)
-                side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
-                position_embeds = self.adapter(features, side_to_move=side_tensor)
-            elif self.config.mode == "maia":
-                if fen is None:
-                    raise ValueError("FEN is required for maia features mode")
-                # Extract features on fly
-                features = extract_maia_features(fen).unsqueeze(0).to(device) # (1, 18, 8, 8)
-                side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
-                if getattr(self.config.maia, "use_main_engineered_concat", False):
-                    engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
-                    position_embeds = self.adapter(
-                        features,
-                        side_to_move=side_tensor,
-                        engineered_features=engineered,
-                    )
-                else:
-                    position_embeds = self.adapter(features, side_to_move=side_tensor)
-            elif self.config.mode == "chess_fusion":
-                if fen is None:
-                    raise ValueError("FEN is required for chess_fusion mode")
-                features = extract_maia_features(fen).unsqueeze(0).to(device)
-                side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
-                fusion_kwargs = {'side_to_move': side_tensor}
-                if maia_policy is not None:
-                    fusion_kwargs['precomputed_policy'] = maia_policy.to(device)
-                if getattr(self.config.chess_fusion, "use_engineered_concat", False):
-                    engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
-                    fusion_kwargs['engineered_features'] = engineered
-                adapter_out = self.adapter(features, **fusion_kwargs)
-                self._last_adapter_out = adapter_out  # Store for live inference inspection
-                perceiver_latents = adapter_out['perceiver_latents']  # (B, N_lat, perceiver_dim)
-                policy_latents = adapter_out.get('policy_latents', None)
-                # Set Perceiver latents for gated cross-attention during generation
-                ctx = adapter_out.get('context', None)
-                if ctx is not None:
-                    ctx = ctx.to(dtype=self.torch_dtype)
-                csmp_square_tokens = adapter_out.get('csmp_square_tokens', None)
-                if csmp_square_tokens is not None:
-                    csmp_square_tokens = csmp_square_tokens.to(dtype=self.torch_dtype)
-                if policy_latents is not None:
-                    policy_latents = policy_latents.to(dtype=self.torch_dtype)
-                self.adapter.set_chess_context(
-                    perceiver_latents.to(dtype=self.torch_dtype),
-                    ctx,
-                    csmp_square_tokens=csmp_square_tokens,
-                    policy_latents=policy_latents,
-                )
-                prepend_embeddings = adapter_out.get('prepend_embeddings', None)
-                if prepend_embeddings is not None:
-                    if prepend_embeddings.size(1) != self.num_prefix_tokens:
-                        raise ValueError(
-                            "Mismatch between adapter prefix token count and model expectation: "
-                            f"{prepend_embeddings.size(1)} vs {self.num_prefix_tokens}"
-                        )
-                    position_embeds = prepend_embeddings
-                else:
-                    position_embeds = perceiver_latents.new_zeros(1, 0, self.llm.config.hidden_size)
-            else:
-                 raise ValueError(f"Unknown mode: {self.config.mode}")
-            token_embeds = self.llm.get_input_embeddings()(input_ids)
-            
-            # Cast adapter output to match LLM embedding dtype
-            position_embeds = position_embeds.to(dtype=token_embeds.dtype)
-            
-            # Optionally add FEN tokens right after position embeddings
-            if self.use_fen_tokens and fen is not None:
-                fen_encodings = self.tokenizer(
-                    [fen],
-                    padding=True,
-                    truncation=True,
-                    max_length=64,
-                    return_tensors="pt",
-                )
-                fen_ids = fen_encodings["input_ids"].to(device)
-                fen_mask = fen_encodings["attention_mask"].to(device)
-                fen_embeds = self.llm.get_input_embeddings()(fen_ids)
-                fen_len = fen_ids.shape[1]
-            else:
-                fen_embeds = None
-                fen_mask = None
-                fen_len = 0
-            
-            if fen_embeds is not None:
-                combined_embeds = torch.cat([position_embeds, fen_embeds, token_embeds], dim=1)
-            else:
-                combined_embeds = torch.cat([position_embeds, token_embeds], dim=1)
-            
-            # Extend attention mask
-            prefix_mask = torch.ones(
-                (batch_size, self.num_prefix_tokens),
-                dtype=attention_mask.dtype,
-                device=device
-            )
-            if fen_len > 0 and fen_mask is not None:
-                combined_mask = torch.cat([prefix_mask, fen_mask, attention_mask], dim=1)
-            else:
-                combined_mask = torch.cat([prefix_mask, attention_mask], dim=1)
 
-            if self.config.mode == "chess_fusion" and not self.lm_enabled:
-                self.adapter.clear_chess_context()
-                return "[LM disabled] Adapter-only mode active; commentary generation skipped."
-            
-            outputs = self.llm.generate(
-                inputs_embeds=combined_embeds,
-                attention_mask=combined_mask,
-                position_ids=self._build_position_ids(
-                    combined_mask,
-                    prefix_len=self.num_prefix_tokens,
-                ),
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=True,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id,
+        with torch.inference_mode():
+            generation_inputs = self.prepare_generation_inputs(
+                lc0_hidden_states=lc0_hidden_states,
+                side_to_move=side_to_move,
+                prompt=prompt,
+                fen=fen,
+                maia_policy=maia_policy,
             )
-        
-        # Clear chess context after generation
-        if self.config.mode == "chess_fusion":
-            self.adapter.clear_chess_context()
-        
-        # Decode (skip prefix tokens not needed as generate with inputs_embeds returns only new tokens)
+            if self.config.mode == "chess_fusion" and not self.lm_enabled:
+                self.clear_generation_context()
+                return "[LM disabled] Adapter-only mode active; commentary generation skipped."
+
+            self.set_generation_context(
+                generation_inputs["generation_context"],
+                text_attention_mask=generation_inputs["combined_mask"],
+            )
+            try:
+                outputs = self.llm.generate(
+                    inputs_embeds=generation_inputs["combined_embeds"],
+                    attention_mask=generation_inputs["combined_mask"],
+                    position_ids=generation_inputs["position_ids"],
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=True,
+                    use_cache=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            finally:
+                self.clear_generation_context()
+
         generated_ids = outputs[0]
         commentary = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         if return_ids:
