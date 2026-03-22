@@ -283,6 +283,11 @@ class DecodeSession:
             clean_up_tokenization_spaces=False,
         )
 
+    def _reset_decode_runtime(self) -> None:
+        reset_fn = getattr(self.model, "reset_decode_inspector_runtime", None)
+        if callable(reset_fn):
+            reset_fn()
+
     def _llm_autocast_context(self):
         if not torch.cuda.is_available():
             return nullcontext()
@@ -371,18 +376,14 @@ class DecodeSession:
             clean_up_tokenization_spaces=False,
         )
 
-    def start(self, fen: str, prompt: Optional[str] = None) -> dict[str, Any]:
-        board = chess.Board(fen)
-        prompt = (prompt or DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
+    def _prime_current_session(self) -> None:
+        if self.board is None or self.fen is None:
+            raise RuntimeError("Cannot prime decode session without an active board position.")
 
-        self.reset()
-        self.board = board
-        self.fen = board.fen()
-        self.prompt = prompt
-
+        self._reset_decode_runtime()
         generation_inputs = self.model.prepare_generation_inputs(
             lc0_hidden_states=None,
-            side_to_move=board.turn,
+            side_to_move=self.board.turn,
             prompt=self.prompt,
             fen=self.fen,
             maia_policy=None,
@@ -397,6 +398,17 @@ class DecodeSession:
             text_attention_mask=self.attention_mask,
         )
         self._update_from_outputs(outputs)
+
+    def start(self, fen: str, prompt: Optional[str] = None) -> dict[str, Any]:
+        board = chess.Board(fen)
+        prompt = (prompt or DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
+
+        self.reset()
+        self.board = board
+        self.fen = board.fen()
+        self.prompt = prompt
+
+        self._prime_current_session()
         return self.snapshot()
 
     def step(self, token_id: Optional[int] = None) -> dict[str, Any]:
@@ -442,6 +454,23 @@ class DecodeSession:
         self._update_from_outputs(outputs)
         return self.snapshot()
 
+    def step_back(self) -> dict[str, Any]:
+        if not self.has_active_session:
+            raise RuntimeError("No active decode session. Start one first.")
+        if not self.generated_token_ids:
+            return self.snapshot()
+
+        target_token_ids = list(self.generated_token_ids[:-1])
+        target_fen = self.fen
+        target_prompt = self.prompt
+        if target_fen is None:
+            raise RuntimeError("Decode session is missing its FEN state.")
+
+        self.start(target_fen, target_prompt)
+        for previous_token_id in target_token_ids:
+            self.step(token_id=previous_token_id)
+        return self.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "fen": self.fen,
@@ -455,6 +484,7 @@ class DecodeSession:
             "board_squares": _board_squares(self.board) if self.board is not None else [],
             "side_to_move": "w" if self.board is not None and self.board.turn else "b",
             "eos_reached": bool(self.eos_reached),
+            "can_step_back": bool(self.generated_token_ids),
         }
 
 
@@ -478,6 +508,10 @@ class InspectorAppState:
     def step_session(self, token_id: Optional[int]) -> dict[str, Any]:
         with self.lock:
             return self.session.step(token_id=token_id)
+
+    def step_back_session(self) -> dict[str, Any]:
+        with self.lock:
+            return self.session.step_back()
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -551,7 +585,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     .controls {
       display: grid;
-      grid-template-columns: 1.4fr 1fr auto auto;
+      grid-template-columns: 1.4fr 1fr auto auto auto;
       gap: 14px;
       align-items: end;
       margin-top: 16px;
@@ -816,7 +850,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <section class="hero">
       <div>
         <h1>Structured Decode Inspector</h1>
-        <p>Step through commentary generation one token at a time, inspect the live top-5 next-token distribution, and compare aggregate, CSMP, Perceiver, and Policy square weights for the currently selected x-attn layer.</p>
+        <p>Step through commentary generation token by token, move backward to earlier decode boundaries, inspect the live top-5 next-token distribution, and compare aggregate, CSMP, Perceiver, and Policy square weights for the currently selected x-attn layer.</p>
       </div>
       <div class="controls">
         <div class="control">
@@ -828,6 +862,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <textarea id="prompt-input">Provide commentary on this chess position.</textarea>
         </div>
         <button class="primary" id="restart-btn">Restart</button>
+        <button class="secondary" id="step-back-btn">Step Back</button>
         <button class="secondary" id="step-btn">Step (Greedy)</button>
       </div>
       <div class="status-bar" id="status-bar"></div>
@@ -1038,6 +1073,7 @@ HTML_PAGE = """<!DOCTYPE html>
       syncLayerOptions(session?.available_layers || []);
       renderTracePanel();
       document.getElementById("step-btn").disabled = !session || !!session.eos_reached;
+      document.getElementById("step-back-btn").disabled = !session || !(session.can_step_back);
     }
 
     async function fetchJson(path, options = {}) {
@@ -1087,7 +1123,25 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
+    async function stepBackSession() {
+      setStatus("Rewinding one decode step...");
+      try {
+        session = await fetchJson("/api/backstep", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        setStatus(session.can_step_back ? "Moved back one step." : "Returned to the prompt boundary.");
+        renderSession();
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
     document.getElementById("restart-btn").addEventListener("click", restartSession);
+    document.getElementById("step-back-btn").addEventListener("click", async () => {
+      await stepBackSession();
+    });
     document.getElementById("step-btn").addEventListener("click", async () => {
       await stepSession(null);
     });
@@ -1170,6 +1224,11 @@ def _make_handler(app_state: InspectorAppState):
                 if self.path == "/api/step":
                     token_id = body.get("token_id", None)
                     snapshot = app_state.step_session(token_id=token_id)
+                    _write_json(self, 200, snapshot)
+                    return
+
+                if self.path == "/api/backstep":
+                    snapshot = app_state.step_back_session()
                     _write_json(self, 200, snapshot)
                     return
 

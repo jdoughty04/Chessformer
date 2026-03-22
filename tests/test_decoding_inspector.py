@@ -74,6 +74,9 @@ class StubAdapter:
     def get_last_token_structured_traces(self, sample_index: int = 0):
         return self.current_trace
 
+    def reset_runtime(self) -> None:
+        self.current_trace = self.trace_sequence[0] if self.trace_sequence else {}
+
 
 class ScriptedLLM(nn.Module):
     def __init__(self, logits_sequence, adapter: StubAdapter):
@@ -85,12 +88,14 @@ class ScriptedLLM(nn.Module):
         ]
         self.adapter = adapter
         self.calls = []
+        self._call_index = 0
 
     def get_input_embeddings(self):
         return self.embedding
 
     def forward(self, **kwargs):
-        call_index = len(self.calls)
+        call_index = self._call_index
+        self._call_index += 1
         self.calls.append(kwargs)
         if self.adapter.trace_sequence:
             self.adapter.current_trace = self.adapter.trace_sequence[
@@ -98,6 +103,10 @@ class ScriptedLLM(nn.Module):
             ]
         logits = self.logits_sequence[min(call_index, len(self.logits_sequence) - 1)]
         return ScriptedOutput(logits=logits, past_key_values=f"pkv-{call_index}")
+
+    def reset_runtime(self):
+        self.calls = []
+        self._call_index = 0
 
 
 class StubModel:
@@ -130,6 +139,10 @@ class StubModel:
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         return position_ids
+
+    def reset_decode_inspector_runtime(self):
+        self.llm.reset_runtime()
+        self.adapter.reset_runtime()
 
 
 class CountingContext:
@@ -165,6 +178,7 @@ def test_decode_session_prime_returns_top_tokens_before_any_step():
     assert snapshot["top_tokens"][0]["token_id"] == 2
     assert snapshot["available_layers"] == [7]
     assert "7" in snapshot["layer_traces"]
+    assert snapshot["can_step_back"] is False
 
 
 def test_decode_session_greedy_step_appends_exactly_one_token():
@@ -181,6 +195,7 @@ def test_decode_session_greedy_step_appends_exactly_one_token():
     assert snapshot["emitted_token_ids"] == [2]
     assert snapshot["emitted_tokens"] == ["tok2"]
     assert snapshot["top_tokens"][0]["token_id"] == 3
+    assert snapshot["can_step_back"] is True
 
 
 def test_decode_session_forced_step_honors_selected_token():
@@ -214,6 +229,46 @@ def test_decode_session_eos_disables_future_steps():
     assert after_first["eos_reached"] is True
     assert after_second["emitted_token_ids"] == [4]
     assert len(session.model.llm.calls) == 2
+
+
+def test_decode_session_step_back_restores_previous_token_boundary():
+    session = _build_session(
+        [
+            [0.1, 0.4, 2.5, 0.3, -0.2, 0.0],
+            [0.0, 0.2, 0.1, 1.8, -0.5, -0.1],
+            [0.3, 1.6, 0.1, -0.2, -0.5, 0.0],
+        ]
+    )
+    session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+    session.step()
+    session.step(token_id=1)
+
+    snapshot = session.step_back()
+
+    assert snapshot["emitted_token_ids"] == [2]
+    assert snapshot["generated_text"] == "tok2"
+    assert snapshot["top_tokens"][0]["token_id"] == 3
+    assert snapshot["can_step_back"] is True
+    assert snapshot["eos_reached"] is False
+
+
+def test_decode_session_step_back_from_eos_restores_active_distribution():
+    session = _build_session(
+        [
+            [0.0, -0.2, 0.1, 0.3, 4.0, -0.5],
+            [0.1, 0.2, 0.3, 0.4, -0.1, -0.2],
+        ]
+    )
+    session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+    session.step()
+
+    snapshot = session.step_back()
+
+    assert snapshot["emitted_token_ids"] == []
+    assert snapshot["generated_text"] == ""
+    assert snapshot["eos_reached"] is False
+    assert snapshot["top_tokens"][0]["token_id"] == 4
+    assert snapshot["can_step_back"] is False
 
 
 def test_decode_session_wraps_llm_calls_in_autocast_context():

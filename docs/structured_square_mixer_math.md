@@ -385,3 +385,28 @@ That combination is why the current design uses:
 The source types are semantically asymmetric (`csmp`, `perc`, `pol`), so
 forcing them toward equal usage would be a different inductive bias from the one
 implemented here.
+
+## 13. Mapping The Math To The Decode Inspector GUI
+
+The browser inspector in [decoding_inspector.md](decoding_inspector.md) is a
+direct visualization of the quantities defined in this document.
+
+The mapping is:
+
+- `Top-5 next tokens`
+  - the current decoder softmax over next-token logits
+- `CSMP`, `Perceiver`, and `Policy` boards
+  - the three aligned source blocks inside the `192` slot distribution
+- `Aggregate` board
+  - the source-marginalized square distribution
+    $p_i^{sq} = \sum_s \alpha_{s,i}$
+- layer dropdown
+  - chooses which fusion layer's structured routing trace is displayed
+
+Important detail:
+
+- the GUI shows the selected layer's routing for the last valid text token in
+  the current decode step, not an average over the whole sequence
+
+So this document answers "what is the exact computation?" while the GUI answers
+"what did the model just do on this concrete position and token?"
