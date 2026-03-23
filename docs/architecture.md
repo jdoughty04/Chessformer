@@ -1,6 +1,11 @@
 # Architecture
 
-The core idea is to keep square-level structure alive for as long as possible, rather than collapsing a chess position into a single vector before the LLM sees it.
+While the best performing neural chess engines traditionally use full 64x64 attention mechanisms (and often CNN stems), specializing the architecture is a promising approach. This paper [Enhancing Chess Reinforcement Learning with Graph Representations](https://arxiv.org/pdf/2410.23753) found that sparse, relation-specific attention mechanisms have higher learning affinity in lower-compute training regimes.
+
+This approach uses expressive self-attention mechanisms to learn positional properties, but structurally enforces biases toward square-level representations so that squares encode information and relationships that are directly related to them. The idea is that keeping square-level representations:
+- Naturally adheres to a useful inductive bias for chess, potentially improving optimization and transferability
+- Allows for better mechanistic interpretability and debugging as we can probe how the model processes information at the square level
+-
 
 ## Pipeline
 
@@ -30,7 +35,7 @@ This gives the model a board graph that encodes legal geometry before the Percei
 
 ### Relative Position Modes
 
-CSMP supports three modes for how square pairs interact:
+CSMP supports three modes for optional relative position encoding schemes that influence how square pairs interact:
 
 | Mode | Behavior |
 |------|----------|
@@ -44,9 +49,9 @@ Source: `src/training/chess_structure_mp.py`
 
 `SquareLatentEncoder` is a Perceiver-style bottleneck with **65 structured latents**: 64 square-aligned plus 1 global.
 
-Each Perceiver block runs latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent primarily reads its own square token, while the global latent aggregates across the full board. This preserves square identity throughout.
+Each Perceiver block runs latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent only cross-attends to its corresponding square token from the CSMP, along with the side token. Self attention remains global, and the global latent's cross attention is fully connected. The own-square masking preserves square identity while allowing some global interaction.
 
-A second readout, `_structured_policy_square_readout()`, produces 64 policy latents; the shared representation used by both the auxiliary chess heads and the LLM fusion bridge.
+A subsequent readout, `_structured_policy_square_readout()`, produces 64 policy latents; also using strict-own-square masking, this is shared between several auxiliary prediction heads.
 
 Source: `src/training/chess_fusion_model.py`
 
@@ -68,8 +73,7 @@ These losses let the adapter learn chess structure even when the LLM is frozen o
 
 Selected decoder layers are wrapped with `FusionDecoderLayer`, which injects chess context via gated cross-attention.
 
-The active structured fusion mode is `structured_cross_attn` (legacy alias:
-`structured_square_mixer`). Each selected decoder layer forms text queries from
+The active structured fusion mode is `structured_cross_attn`. Each selected decoder layer forms text queries from
 `LayerNorm(hidden_states) -> q_proj`, then runs two per-head attention branches:
 
 - square attention over $64 \times 3$ aligned slots (CSMP, Perceiver, Policy per square)
@@ -85,7 +89,7 @@ Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-
 
 In that mode the structured square table becomes $64 \times 4$, and the inspector exposes an additional `Engineered` board.
 
-There is also a stronger ablation mode: `engineered_only_xattn_ablation: true`.
+There is also a strong ablation mode: `engineered_only_xattn_ablation: true`.
 In that configuration, the adapter backbone, CSMP stack, Perceiver, prepended
 latents, pseudotokens, and auxiliary adapter heads are all skipped. Structured
 x-attn is trained against a single square-aligned source:
@@ -98,16 +102,12 @@ from the engineered features plus side-to-move rather than learned adapter
 latents. That keeps the experiment focused on whether x-attn alone can learn to
 route grounded square-local engineered features into the LLM.
 
-This is different from the older `use_engineered_concat` flag, which only
-concatenates those same `205` channels into the Perceiver input once at the
-front of the model. The new structured source keeps the engineered features
-available directly at fusion time.
+With the structured source enabled, those same `205` channels stay directly
+available at fusion time instead of being used only at the front of the model.
 
-Runtime structured fusion is always per-head attention. The config field
-`xattn_structured_router_mode` is kept only for backward compatibility; if an
-older config requests `shared`, it is accepted with a warning and coerced to
-`per_head`. The inspector still exposes aggregate views by averaging or
-gate-weighting the per-head attention maps.
+Runtime structured fusion uses per-head attention. The inspector can show
+either individual heads or aggregate views by averaging or gate-weighting the
+per-head attention maps.
 
 The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
 

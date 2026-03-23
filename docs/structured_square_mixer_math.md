@@ -6,9 +6,6 @@ structured decoder fusion mode:
 
 - `xattn_mode: structured_cross_attn`
 
-The legacy alias `xattn_mode: structured_square_mixer` loads the same
-implementation.
-
 It covers:
 
 - hidden-state query formation

@@ -14,7 +14,7 @@ The same config file supports multiple training regimes by toggling a few key fl
 
 ### Full Commentary Training (LLM + Adapter)
 
-The default mode. The chess adapter encodes the position, auxiliary chess heads provide grounding losses, and the LLM generates commentary.
+The default mode. The chess adapter encodes the position, auxiliary chess heads provide grounding losses, and the LLM generates commentary. Disable for fast adapter-only pretraining.
 
 ```yaml
 model:
@@ -112,7 +112,6 @@ All objective weights are configurable. Set weight to `0.0` to disable any head.
 
 For structured fusion runs, the most important structured-attention controls are usually:
 
-- `xattn_structured_router_mode`: compatibility-only; `shared` is deprecated and is coerced to `per_head`, which is the only runtime behavior.
 - `xattn_text_gate_mode`: `tanh_head` adds a token-conditioned per-head gate on top of the learned static head gates.
 - `xattn_structured_use_engineered_source`: adds a fourth structured square-attention source built from the `main` engineered square features.
 - `engineered_only_xattn_ablation`: removes the backbone / CSMP / Perceiver path and trains structured x-attn against the engineered source alone.

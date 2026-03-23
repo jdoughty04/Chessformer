@@ -7,26 +7,34 @@ commentary generation one token at a time while visualizing how a
 This tool is implemented in
 `src/inference/decoding_inspector.py`.
 
+
+## Demo
+
+![alt text](../assets/decoding_inspector.png)
+
+The weighted aggregated attention matrix shows the model attends highest to the e2 square while mentioning the pawn on e2.
+
+
 ## When To Use It
 
 Use the inspector when you want to answer questions like:
 
-- which token the model currently wants to emit next
-- how peaked or uncertain the next-token distribution is
-- which squares a selected cross-attention layer used to produce the last token
+- what does the top-5 token distribution look like at each step?
+- how peaked or uncertain is the decoder's confidence?
+- which squares are being attended to for key tokens?
 - whether a layer is reading more from CSMP, Perceiver, Policy, or optional Engineered features
 - whether different x-attn heads are specializing on different squares or sources
 - how large the token-conditioned effective chess gates are for the current token
 
 This is primarily an interpretability and debugging tool for
-`xattn_mode: structured_cross_attn` (legacy alias: `structured_square_mixer`).
+`xattn_mode: structured_cross_attn`.
 
 ## Supported Checkpoints
 
 The GUI currently supports only checkpoints that satisfy both conditions:
 
 - `model.mode: chess_fusion`
-- `model.chess_fusion.xattn_mode: structured_cross_attn` (or the deprecated alias `structured_square_mixer`)
+- `model.chess_fusion.xattn_mode: structured_cross_attn`
 
 It fails fast on other checkpoint types because the square heatmaps rely on the
 structured square-attention layout.
@@ -95,10 +103,9 @@ layer before rendering the boards.
 
 The head dropdown behaves as follows:
 
-- `All Heads` shows the backward-compatible aggregate view
+- `All Heads` shows the aggregate view
 - `All Layers` composes with the head selector, so you can inspect the mean of a specific head index across layers or keep the fully aggregated `All Layers` + `All Heads` view
 - individual head options expose that head's own square and global attention
-- `xattn_structured_router_mode: shared` is a deprecated config alias and is coerced to `per_head` at runtime
 - the `View` dropdown chooses how `All Heads` is aggregated:
   - `Mean Attention`: plain mean over per-head square attention distributions
   - `Gate-Weighted Attention`: mean over per-head square attention distributions weighted by `|effective_gate_h|`
@@ -241,8 +248,3 @@ The inspector is the visual counterpart to
 If you want the exact equations, use the math doc. If you want to see one decode
 step play out visually on a real position, use the inspector.
 
-## Demo
-
-![alt text](../assets/decoding_inspector.png)
-
-The inspector shows high attention score from the f5 square as the decoder mentions the passed pawn on f5.

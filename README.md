@@ -22,7 +22,6 @@ Current efforts have aimed to train the model on low-entropy factoid-based comme
 
 ![position](assets/position.png)
 
-This lays the foundation for further work toward learning more abstract, human-like commentary styles.
 
 ## Architecture Overview
 
