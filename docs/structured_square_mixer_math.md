@@ -25,7 +25,7 @@ For one decoder fusion layer, let:
 - $d_h = d_\ell / H$: per-head dimension
 - $i \in \{0, \ldots, 63\}$: board-square index
 - $s \in S$: square-aligned source index
-- $k \in \{\mathrm{perc\_global}, \mathrm{side}\}$: global-branch source index
+- $k \in \{\mathrm{percGlobal}, \mathrm{side}\}$: global-branch source index
 
 By default:
 
@@ -66,13 +66,13 @@ There is no recurrent text path. Each token query comes directly from the
 current decoder hidden state:
 
 $$
-\tilde{q}_{b,t} = \operatorname{LN}(h_{b,t})
+\tilde{q}_{b,t} = \mathrm{LN}(h_{b,t})
 $$
 
 The fused multi-head query tensor is:
 
 $$
-Q_{b,t,h} = \operatorname{reshape}_H(W_q \tilde{q}_{b,t}) \in \mathbb{R}^{d_h}
+Q_{b,t,h} = \mathrm{reshape}_{H}(W_q \tilde{q}_{b,t}) \in \mathbb{R}^{d_h}
 $$
 
 Invalid text positions are masked out after query formation, so they contribute
@@ -82,18 +82,18 @@ zero attention output and zero gate usage.
 
 Each active square source is projected independently into LLM space:
 
-- $v_{b,i}^{\mathrm{csmp}} = \operatorname{MLP}_{\mathrm{csmp}}(x_{b,i}^{\mathrm{csmp}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{perc}} = \operatorname{MLP}_{\mathrm{perc}}(x_{b,i}^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{pol}} = \operatorname{MLP}_{\mathrm{pol}}(x_{b,i}^{\mathrm{pol}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{eng}} = \operatorname{Linear}_{\mathrm{eng}}(\operatorname{LN}(x_{b,i}^{\mathrm{eng}})) \in \mathbb{R}^{d_\ell}$ when enabled
+- $v_{b,i}^{\mathrm{csmp}} = \mathrm{MLP}_{\mathrm{csmp}}(x_{b,i}^{\mathrm{csmp}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{perc}} = \mathrm{MLP}_{\mathrm{perc}}(x_{b,i}^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{pol}} = \mathrm{MLP}_{\mathrm{pol}}(x_{b,i}^{\mathrm{pol}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{eng}} = \mathrm{Linear}_{\mathrm{eng}}(\mathrm{LN}(x_{b,i}^{\mathrm{eng}})) \in \mathbb{R}^{d_\ell}$ when enabled
 
 These are concatenated into one aligned square table:
 
 $$
 V_b^{\mathrm{sq}} =
 \left[
-v_{b,0}^{s_1}, \ldots, v_{b,63}^{s_1},
-v_{b,0}^{s_2}, \ldots,
+v_{b,0}^{s_{1}}, \ldots, v_{b,63}^{s_{1}},
+v_{b,0}^{s_{2}}, \ldots,
 v_{b,63}^{s_{N_{\mathrm{src}}}}
 \right]
 $$
@@ -103,7 +103,7 @@ so $V_b^{\mathrm{sq}} \in \mathbb{R}^{(64 N_{\mathrm{src}}) \times d_\ell}$.
 The same projected values are also mapped to attention keys:
 
 $$
-K_b^{\mathrm{sq}} = \operatorname{reshape}_H(W_k^{\mathrm{sq}} V_b^{\mathrm{sq}})
+K_b^{\mathrm{sq}} = \mathrm{reshape}_{H}(W_k^{\mathrm{sq}} V_b^{\mathrm{sq}})
 \in \mathbb{R}^{(64 N_{\mathrm{src}}) \times H \times d_h}
 $$
 
@@ -119,20 +119,20 @@ $$
 
 The structured path keeps a separate 2-token global branch:
 
-- $u_b^{\mathrm{perc\_global}} = \operatorname{MLP}_{\mathrm{perc\_global}}(g_b^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
-- $u_b^{\mathrm{side}} = \operatorname{MLP}_{\mathrm{side}}(g_b^{\mathrm{side}}) \in \mathbb{R}^{d_\ell}$
+- $u_b^{\mathrm{percGlobal}} = \mathrm{MLP}_{\mathrm{percGlobal}}(g_b^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
+- $u_b^{\mathrm{side}} = \mathrm{MLP}_{\mathrm{side}}(g_b^{\mathrm{side}}) \in \mathbb{R}^{d_\ell}$
 
 Stack them as:
 
 $$
-V_b^{\mathrm{glb}} = \left[u_b^{\mathrm{perc\_global}}, u_b^{\mathrm{side}}\right]
+V_b^{\mathrm{glb}} = \left[u_b^{\mathrm{percGlobal}}, u_b^{\mathrm{side}}\right]
 \in \mathbb{R}^{2 \times d_\ell}
 $$
 
 and project keys:
 
 $$
-K_b^{\mathrm{glb}} = \operatorname{reshape}_H(W_k^{\mathrm{glb}} V_b^{\mathrm{glb}})
+K_b^{\mathrm{glb}} = \mathrm{reshape}_{H}(W_k^{\mathrm{glb}} V_b^{\mathrm{glb}})
 \in \mathbb{R}^{2 \times H \times d_h}
 $$
 
@@ -146,7 +146,7 @@ a_{b,t,h,j}^{\mathrm{sq}} =
 $$
 
 $$
-\alpha_{b,t,h,j}^{\mathrm{sq}} = \operatorname{softmax}_j(a_{b,t,h,j}^{\mathrm{sq}})
+\alpha_{b,t,h,j}^{\mathrm{sq}} = \mathrm{softmax}_{j}(a_{b,t,h,j}^{\mathrm{sq}})
 $$
 
 where the softmax runs over all square/source slots $j$.
@@ -176,7 +176,7 @@ a_{b,t,h,k}^{\mathrm{glb}} =
 $$
 
 $$
-\beta_{b,t,h,k}^{\mathrm{glb}} = \operatorname{softmax}_k(a_{b,t,h,k}^{\mathrm{glb}})
+\beta_{b,t,h,k}^{\mathrm{glb}} = \mathrm{softmax}_{k}(a_{b,t,h,k}^{\mathrm{glb}})
 $$
 
 $$
@@ -196,7 +196,7 @@ If `xattn_text_gate_mode: tanh_head`, the layer also predicts token-conditioned
 gate logits directly from the normalized decoder hidden states:
 
 $$
-\ell_{b,t,h} = \operatorname{MLP}_{\mathrm{gate}}(\tilde{q}_{b,t})
+\ell_{b,t,h} = \mathrm{MLP}_{\mathrm{gate}}(\tilde{q}_{b,t})
 $$
 
 The effective structured gate is:
@@ -223,7 +223,7 @@ $$
 Heads are concatenated, projected back to model width, and added residually:
 
 $$
-O_{b,t} = W_o \operatorname{concat}_h(O_{b,t,h})
+O_{b,t} = W_o \mathrm{concat}_{h}(O_{b,t,h})
 $$
 
 $$
@@ -303,12 +303,12 @@ The diversity loss for one layer is:
 
 $$
 L_{\mathrm{div}}^{\mathrm{layer}} =
-\operatorname{mean}_{b,t,h}(w_{b,t,h})
+\mathrm{mean}_{b,t,h}(w_{b,t,h})
 \cdot
-\operatorname{relu}(\mathrm{target\_entropy} - U_{\mathrm{layer}})
+\mathrm{relu}(\tau_{\mathrm{entropy}} - U_{\mathrm{layer}})
 $$
 
-with `target_entropy = structured_xattn_square_diversity_target_entropy`,
+with $\tau_{\mathrm{entropy}} =$ `structured_xattn_square_diversity_target_entropy`,
 clamped to $[0, 1]$.
 
 This keeps the regularizer weak when the structured path is mostly closed, while
@@ -320,17 +320,17 @@ structured branch.
 The mean absolute gate usage for one layer is:
 
 $$
-G_{\mathrm{layer}} = \operatorname{mean}_{b,t,h}\left|g_{b,t,h}^{\mathrm{eff}}\right|
+G_{\mathrm{layer}} = \mathrm{mean}_{b,t,h}\left|g_{b,t,h}^{\mathrm{eff}}\right|
 $$
 
 The corresponding hinge loss is:
 
 $$
 L_{\mathrm{gate}}^{\mathrm{layer}} =
-\operatorname{relu}(\mathrm{target\_usage} - G_{\mathrm{layer}})
+\mathrm{relu}(\tau_{\mathrm{usage}} - G_{\mathrm{layer}})
 $$
 
-with `target_usage = structured_xattn_gate_usage_target`, clamped to $[0, 1]$.
+with $\tau_{\mathrm{usage}} =$ `structured_xattn_gate_usage_target`, clamped to $[0, 1]$.
 
 ## 12. Loss Composition Across Layers
 
@@ -340,26 +340,18 @@ Across all active fusion layers in `structured_cross_attn` mode:
 - `structured_xattn_square_diversity_loss` is the mean of $L_{\mathrm{div}}^{\mathrm{layer}}$
 - `structured_xattn_gate_usage_loss` is the mean of $L_{\mathrm{gate}}^{\mathrm{layer}}$
 
-The training loss adds:
+The training loss adds, where $\lambda_{\mathrm{sparse}}$,
+$\lambda_{\mathrm{div}}$, and $\lambda_{\mathrm{gate}}$ are the configured
+weights `structured_xattn_sparse_weight`,
+`structured_xattn_square_diversity_weight`, and
+`structured_xattn_gate_usage_weight`:
 
 $$
-\mathrm{structured\_xattn\_sparse\_weight}
-\cdot
-\mathrm{structured\_xattn\_sparse\_loss}
-$$
-
-$$
-+\;
-\mathrm{structured\_xattn\_square\_diversity\_weight}
-\cdot
-\mathrm{structured\_xattn\_square\_diversity\_loss}
-$$
-
-$$
-+\;
-\mathrm{structured\_xattn\_gate\_usage\_weight}
-\cdot
-\mathrm{structured\_xattn\_gate\_usage\_loss}
+\lambda_{\mathrm{sparse}} \, \mathrm{structuredXattnSparseLoss}
+\;+\;
+\lambda_{\mathrm{div}} \, \mathrm{structuredXattnSquareDiversityLoss}
+\;+\;
+\lambda_{\mathrm{gate}} \, \mathrm{structuredXattnGateUsageLoss}
 $$
 
 ## 13. Inspector And Logging Tensors
