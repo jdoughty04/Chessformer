@@ -116,8 +116,11 @@ per-head attention maps.
 The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
 
 $$
-\tanh(\mathrm{static\_head\_gate} + \mathrm{token\_gate\_logit})
+\tanh(g_h^{\mathrm{static}} + \ell_{b,t,h})
 $$
+
+where $g_h^{\mathrm{static}}$ is the learned per-head static gate and
+$\ell_{b,t,h}$ is the token-conditioned gate logit.
 
 That dynamic gate is produced from the same normalized token state that also
 forms the attention query, so "which chess features matter?" and "how much

@@ -82,10 +82,23 @@ zero attention output and zero gate usage.
 
 Each active square source is projected independently into LLM space:
 
-- $v_{b,i}^{\mathrm{csmp}} = \mathrm{MLP}_{\mathrm{csmp}}(x_{b,i}^{\mathrm{csmp}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{perc}} = \mathrm{MLP}_{\mathrm{perc}}(x_{b,i}^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{pol}} = \mathrm{MLP}_{\mathrm{pol}}(x_{b,i}^{\mathrm{pol}}) \in \mathbb{R}^{d_\ell}$
-- $v_{b,i}^{\mathrm{eng}} = \mathrm{Linear}_{\mathrm{eng}}(\mathrm{LN}(x_{b,i}^{\mathrm{eng}})) \in \mathbb{R}^{d_\ell}$ when enabled
+$$
+v_{b,i}^{\mathrm{csmp}} = \mathrm{MLP}_{\mathrm{csmp}}(x_{b,i}^{\mathrm{csmp}}) \in \mathbb{R}^{d_\ell}
+$$
+
+$$
+v_{b,i}^{\mathrm{perc}} = \mathrm{MLP}_{\mathrm{perc}}(x_{b,i}^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}
+$$
+
+$$
+v_{b,i}^{\mathrm{pol}} = \mathrm{MLP}_{\mathrm{pol}}(x_{b,i}^{\mathrm{pol}}) \in \mathbb{R}^{d_\ell}
+$$
+
+When enabled:
+
+$$
+v_{b,i}^{\mathrm{eng}} = \mathrm{Linear}_{\mathrm{eng}}(\mathrm{LN}(x_{b,i}^{\mathrm{eng}})) \in \mathbb{R}^{d_\ell}
+$$
 
 These are concatenated into one aligned square table:
 
@@ -119,8 +132,13 @@ $$
 
 The structured path keeps a separate 2-token global branch:
 
-- $u_b^{\mathrm{percGlobal}} = \mathrm{MLP}_{\mathrm{percGlobal}}(g_b^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
-- $u_b^{\mathrm{side}} = \mathrm{MLP}_{\mathrm{side}}(g_b^{\mathrm{side}}) \in \mathbb{R}^{d_\ell}$
+$$
+u_b^{\mathrm{percGlobal}} = \mathrm{MLP}_{\mathrm{percGlobal}}(g_b^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}
+$$
+
+$$
+u_b^{\mathrm{side}} = \mathrm{MLP}_{\mathrm{side}}(g_b^{\mathrm{side}}) \in \mathbb{R}^{d_\ell}
+$$
 
 Stack them as:
 
