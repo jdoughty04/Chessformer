@@ -214,7 +214,20 @@ class ChessPositionAdapter(nn.Module):
 # New Engineered & Hybrid Adapters
 # ============================================================================
 
-ENGINEERED_FEATURE_DIM = 204
+ENGINEERED_SQUARE_ID_DIM = 64
+ENGINEERED_PIECE_STATE_DIM = 13  # 12 pieces + explicit empty-square state
+ENGINEERED_ATTACK_MASK_DIM = 64
+ENGINEERED_DEFENSE_MASK_DIM = 64
+ENGINEERED_EMPTY_PIECE_INDEX = 12
+ENGINEERED_PIECE_OFFSET = ENGINEERED_SQUARE_ID_DIM
+ENGINEERED_ATTACK_OFFSET = ENGINEERED_PIECE_OFFSET + ENGINEERED_PIECE_STATE_DIM
+ENGINEERED_DEFENSE_OFFSET = ENGINEERED_ATTACK_OFFSET + ENGINEERED_ATTACK_MASK_DIM
+ENGINEERED_FEATURE_DIM = (
+    ENGINEERED_SQUARE_ID_DIM
+    + ENGINEERED_PIECE_STATE_DIM
+    + ENGINEERED_ATTACK_MASK_DIM
+    + ENGINEERED_DEFENSE_MASK_DIM
+)
 
 _PIECE_TO_INDEX = {
     chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2, 
@@ -223,13 +236,13 @@ _PIECE_TO_INDEX = {
 
 def extract_engineered_features(fen: str, mode: str = "simplified") -> torch.Tensor:
     """
-    Extract 204-dim feature vector per square.
+    Extract engineered feature vector per square.
     
     Args:
         fen: FEN string
         mode: "simplified" (default) or "main".
               Simplified: Populates only explicit Piece/Pos/AttackCount/Flags (~19 dims)
-              Main: Populates all 204 dims including full attack/defense bitmasks
+              Main: Populates all 205 dims including full attack/defense bitmasks
     """
     board = chess.Board(fen)
     features = torch.zeros(64, ENGINEERED_FEATURE_DIM, dtype=torch.float32)
@@ -239,22 +252,27 @@ def extract_engineered_features(fen: str, mode: str = "simplified") -> torch.Ten
     # Actually, legacy dense logic is quite specific. Let's separate cleanly.
     
     if mode == "main":
-        # Main Mode (204 dims)
-        # 1. Position encoding (64 dims) - one-hot identity
+        # Main mode layout:
+        #   0..63    = square identity one-hot
+        #   64..76   = 13-way piece state (12 pieces + empty)
+        #   77..140  = attacked-target bitmask
+        #   141..204 = defended-friendly-target bitmask
         for sq in range(64):
             features[sq, sq] = 1.0
+            if sq not in piece_map:
+                features[sq, ENGINEERED_PIECE_OFFSET + ENGINEERED_EMPTY_PIECE_INDEX] = 1.0
             
-        # 2. Piece encoding (12 dims)
+        # 2. Piece encoding (13 dims including explicit empty state)
         for sq, piece in piece_map.items():
             piece_idx = _PIECE_TO_INDEX[piece.piece_type]
             if piece.color == chess.WHITE:
-                features[sq, 64 + piece_idx] = 1.0
+                features[sq, ENGINEERED_PIECE_OFFSET + piece_idx] = 1.0
             else:
-                features[sq, 64 + piece_idx + 6] = 1.0
+                features[sq, ENGINEERED_PIECE_OFFSET + piece_idx + 6] = 1.0
         
         # 3. Attack vector (64 dims) - "Is square X attacked by piece on square SQ?"
         # Wait, legacy logic was:
-        # for attacked_sq in board.attacks(sq): features[sq, 76 + attacked_sq] = 1.0
+        # for attacked_sq in board.attacks(sq): features[sq, ENGINEERED_ATTACK_OFFSET + attacked_sq] = 1.0
         # This means: "The piece on SQ attacks square attacked_sq"
         
         # 4. Defense vector (64 dims) - "Does piece on SQ defend friendly piece on X?"
@@ -264,12 +282,12 @@ def extract_engineered_features(fen: str, mode: str = "simplified") -> torch.Ten
                 piece = piece_map[sq]
                 # Attack vector (64 dims)
                 for target_sq in board.attacks(sq):
-                    features[sq, 76 + target_sq] = 1.0
+                    features[sq, ENGINEERED_ATTACK_OFFSET + target_sq] = 1.0
                     
                     # Defense vector (64 dims)
                     target_piece = board.piece_at(target_sq)
                     if target_piece is not None and target_piece.color == piece.color:
-                        features[sq, 140 + target_sq] = 1.0
+                        features[sq, ENGINEERED_DEFENSE_OFFSET + target_sq] = 1.0
                         
     else: # mode == "simplified"
         # 1. Piece & Pos
@@ -306,7 +324,7 @@ class EngineeredPositionAdapter(nn.Module):
              llm_dim = 2048 
              
         self.mlp = nn.Sequential(
-            nn.Linear(204, llm_dim),
+            nn.Linear(ENGINEERED_FEATURE_DIM, llm_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(llm_dim, llm_dim),
@@ -362,8 +380,8 @@ class HybridPositionAdapter(nn.Module):
         self.layer_norms = nn.ModuleList([nn.LayerNorm(self.lc0_dim) for _ in range(self.num_layers)])
         
         # Hybrid MLP
-        # Input: Engineered(204) + LC0(4*128)
-        mlp_input = 204 + (self.num_layers * self.lc0_proj_dim)
+        # Input: Engineered(205) + LC0(4*128)
+        mlp_input = ENGINEERED_FEATURE_DIM + (self.num_layers * self.lc0_proj_dim)
         
         self.mlp = nn.Sequential(
             nn.Linear(mlp_input, self.llm_dim),
@@ -406,7 +424,7 @@ class HybridPositionAdapter(nn.Module):
         # extract_engineered_features returns standard A1..H8.
         # So everything is White Perspective.
         
-        combined = torch.cat([engineered_features, lc0_concat], dim=-1) # (B, 64, 716)
+        combined = torch.cat([engineered_features, lc0_concat], dim=-1) # (B, 64, 717)
         square_embeds = self.mlp(combined)
         
         # 3. Side Embeds

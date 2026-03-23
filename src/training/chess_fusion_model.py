@@ -14,7 +14,6 @@ import sys
 import math
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
-import weakref
 
 import torch
 import torch.nn as nn
@@ -38,6 +37,7 @@ def _compiler_disable(fn):
     return compiler.disable(fn)
 
 from training.maia_model import MaiaPolicyModel, elo_to_category
+from training.chess_adapter import ENGINEERED_FEATURE_DIM
 from training.chess_structure_mp import ChessStructureMP, DynamicMaskBuilder, extract_piece_types
 
 try:
@@ -639,7 +639,7 @@ class SquareLatentEncoder(nn.Module):
         num_eval_buckets: int = 5,
         enable_eval_head: bool = True,
         use_engineered_concat: bool = False,
-        engineered_dim: int = 204,
+        engineered_dim: int = ENGINEERED_FEATURE_DIM,
         dropout: float = 0.1,
         structured_latents: bool = False,
         latent_context_mask_type: str = "full",
@@ -2104,24 +2104,22 @@ class GatedCrossAttention(nn.Module):
     """
     Decoder-layer chess fusion module for injection into LLM decoder layers.
 
-    Each instance holds:
-      1. A reference to the shared ``SharedLayerReadout`` (set externally,
-         not owned â€” avoids double-registering parameters).
-      2. A recurrent text state used either for legacy recurrent-query
-         cross-attention or for square-structured source mixing.
-      3. Per-head tanh gating (initialized to 0 â†’ identity at init).
-      4. FFN with reduced multiplier and scalar tanh gate.
-
-    The ``tau`` attribute (layer fraction âˆˆ [0, 1]) is set once by the
-    adapter during ``inject_into_llm``.
+    Text-side queries always come directly from the current decoder hidden
+    states via ``LayerNorm(hidden_states) -> q_proj``.
     """
+
+    _MODE_ALIASES = {
+        "recurrent_query_attn": "cross_attn",
+        "structured_square_mixer": "structured_cross_attn",
+    }
+    _VALID_CANONICAL_MODES = frozenset({"cross_attn", "structured_cross_attn"})
 
     def __init__(
         self,
         llm_dim: int = 2048,
         perceiver_dim: int = 1280,
         context_dim: int = 256,
-        engineered_dim: int = 204,
+        engineered_dim: int = ENGINEERED_FEATURE_DIM,
         num_fusion_tokens: int = 16,
         n_heads: int = 8,
         ffn_mult: int = 2,
@@ -2130,44 +2128,56 @@ class GatedCrossAttention(nn.Module):
         recurrent_query_state_dim: int = 256,
         recurrent_query_use_mlp: bool = False,
         shared_recurrent_query_gru: Optional[nn.GRU] = None,
-        xattn_mode: str = "recurrent_query_attn",
-        structured_router_mode: str = "shared",
+        xattn_mode: str = "cross_attn",
+        structured_router_mode: str = "per_head",
         text_gate_mode: str = "tanh_head",
         use_engineered_source: bool = False,
+        engineered_only_ablation: bool = False,
     ):
         super().__init__()
+        del shared_recurrent_query_gru
         gate_init = float(gate_init)
-        self.llm_dim = llm_dim
+        self.llm_dim = int(llm_dim)
         self.context_dim = int(context_dim)
         self.engineered_dim = int(engineered_dim)
-        self.n_heads = n_heads
-        self.head_dim = llm_dim // n_heads
+        self.n_heads = int(n_heads)
+        self.head_dim = self.llm_dim // self.n_heads
         self.num_fusion_tokens = int(num_fusion_tokens)
-        self.recurrent_query_state_dim = int(recurrent_query_state_dim)
-        self.recurrent_query_use_mlp = bool(recurrent_query_use_mlp)
-        self.xattn_mode = str(xattn_mode)
-        self.structured_router_mode = str(structured_router_mode)
+        self.deprecated_recurrent_query_state_dim = int(recurrent_query_state_dim)
+        self.deprecated_recurrent_query_use_mlp = bool(recurrent_query_use_mlp)
+        self.requested_xattn_mode = str(xattn_mode)
+        self.xattn_mode = self._MODE_ALIASES.get(self.requested_xattn_mode, self.requested_xattn_mode)
+        self.requested_structured_router_mode = str(structured_router_mode)
         self.text_gate_mode = str(text_gate_mode)
         self.use_engineered_source = bool(use_engineered_source)
-        self.structured_square_source_names: Tuple[str, ...] = (
-            ("csmp", "perceiver", "policy", "engineered")
-            if self.use_engineered_source
-            else ("csmp", "perceiver", "policy")
-        )
+        self.engineered_only_ablation = bool(engineered_only_ablation)
+        self.structured_square_source_names: Tuple[str, ...]
+        if self.engineered_only_ablation:
+            self.structured_square_source_names = ("engineered",)
+        elif self.use_engineered_source:
+            self.structured_square_source_names = ("csmp", "perceiver", "policy", "engineered")
+        else:
+            self.structured_square_source_names = ("csmp", "perceiver", "policy")
         self.structured_square_source_count = len(self.structured_square_source_names)
-        self._shared_recurrent_query_gru_ref: Optional[weakref.ReferenceType] = None
-        assert llm_dim % n_heads == 0, f"llm_dim {llm_dim} not divisible by n_heads {n_heads}"
-        if self.xattn_mode not in {"recurrent_query_attn", "structured_square_mixer"}:
+        self.structured_router_mode = (
+            "per_head"
+            if self.xattn_mode == "structured_cross_attn"
+            else self.requested_structured_router_mode
+        )
+        assert self.llm_dim % self.n_heads == 0, (
+            f"llm_dim {self.llm_dim} not divisible by n_heads {self.n_heads}"
+        )
+        if self.xattn_mode not in self._VALID_CANONICAL_MODES:
             raise ValueError(
                 "xattn_mode must be one of "
-                "{'recurrent_query_attn', 'structured_square_mixer'} "
+                "{'cross_attn', 'structured_cross_attn'} "
                 f"(got {self.xattn_mode!r})"
             )
-        if self.structured_router_mode not in {"shared", "per_head"}:
+        if self.requested_structured_router_mode not in {"shared", "per_head"}:
             raise ValueError(
                 "structured_router_mode must be one of "
                 "{'shared', 'per_head'} "
-                f"(got {self.structured_router_mode!r})"
+                f"(got {self.requested_structured_router_mode!r})"
             )
         if self.text_gate_mode not in {"none", "tanh_head"}:
             raise ValueError(
@@ -2176,70 +2186,26 @@ class GatedCrossAttention(nn.Module):
                 f"(got {self.text_gate_mode!r})"
             )
 
-        # --- Shared readout reference (set by ChessFusionAdapter) ---
         self.tau: float = 0.0
-        self._shared_readout: Optional[SharedLayerReadout] = None
-
-        # Shared output projection from either recurrent cross-attn or
-        # structured square mixing back into the LLM residual stream.
-        self.q_norm = None
-        self.q_proj = None
-        self.k_proj = None
-        self.v_proj = None
-        self.o_proj = nn.Linear(llm_dim, llm_dim, bias=False)
+        self.query_norm = nn.LayerNorm(self.llm_dim)
+        self.q_proj = nn.Linear(self.llm_dim, self.llm_dim, bias=False)
+        self.o_proj = nn.Linear(self.llm_dim, self.llm_dim, bias=False)
         self.attn_dropout = nn.Dropout(dropout)
 
-        # Per-head gating: (1, n_heads, 1, 1) â€” broadcasts over batch, seq, head_dim
-        self.gate = nn.Parameter(torch.full((1, n_heads, 1, 1), gate_init))
+        self.gate = nn.Parameter(torch.full((1, self.n_heads, 1, 1), gate_init))
 
-        # Canonical x-attn mode:
-        # GRU(text) -> queries, then direct cross-attention to policy/perceiver/csmp.
-        if self.recurrent_query_state_dim <= 0:
-            raise ValueError(
-                f"recurrent_query_state_dim must be > 0 (got {self.recurrent_query_state_dim})"
-            )
-        if abs(float(gate_init)) < 1e-12:
-            print(
-                "  [XAttn recurrent-query] gate_init is 0.0; recurrent-query path gradients "
-                "to Q/K/V/GRU begin only after head gates open."
-            )
-        self.recurrent_query_norm = nn.LayerNorm(llm_dim)
-        if shared_recurrent_query_gru is not None:
-            if shared_recurrent_query_gru.input_size != llm_dim:
-                raise ValueError(
-                    f"shared_recurrent_query_gru.input_size ({shared_recurrent_query_gru.input_size}) "
-                    f"!= llm_dim ({llm_dim})"
-                )
-            if shared_recurrent_query_gru.hidden_size != self.recurrent_query_state_dim:
-                raise ValueError(
-                    f"shared_recurrent_query_gru.hidden_size ({shared_recurrent_query_gru.hidden_size}) "
-                    f"!= recurrent_query_state_dim ({self.recurrent_query_state_dim})"
-                )
-            self._shared_recurrent_query_gru_ref = weakref.ref(shared_recurrent_query_gru)
-            self.recurrent_query_gru = None
-        else:
-            self.recurrent_query_gru = nn.GRU(
-                input_size=llm_dim,
-                hidden_size=self.recurrent_query_state_dim,
-                num_layers=1,
-                batch_first=True,
-            )
-        if self.xattn_mode == "recurrent_query_attn":
-            self.recurrent_query_proj = self._build_recurrent_head(llm_dim)
+        if self.xattn_mode == "cross_attn":
             self.perc_kv_norm = nn.LayerNorm(perceiver_dim)
-            self.perc_k_proj = nn.Linear(perceiver_dim, llm_dim, bias=False)
-            self.perc_v_proj = nn.Linear(perceiver_dim, llm_dim, bias=False)
+            self.perc_k_proj = nn.Linear(perceiver_dim, self.llm_dim, bias=False)
+            self.perc_v_proj = nn.Linear(perceiver_dim, self.llm_dim, bias=False)
 
             self.csmp_kv_norm = nn.LayerNorm(self.context_dim)
-            self.csmp_k_proj = nn.Linear(self.context_dim, llm_dim, bias=False)
-            self.csmp_v_proj = nn.Linear(self.context_dim, llm_dim, bias=False)
+            self.csmp_k_proj = nn.Linear(self.context_dim, self.llm_dim, bias=False)
+            self.csmp_v_proj = nn.Linear(self.context_dim, self.llm_dim, bias=False)
 
             self.policy_kv_norm = nn.LayerNorm(perceiver_dim)
-            self.policy_k_proj = nn.Linear(perceiver_dim, llm_dim, bias=False)
-            self.policy_v_proj = nn.Linear(perceiver_dim, llm_dim, bias=False)
-
-            # Learned source blend gates. Init > 0 so all sources are available
-            # once xattn head gates begin to open.
+            self.policy_k_proj = nn.Linear(perceiver_dim, self.llm_dim, bias=False)
+            self.policy_v_proj = nn.Linear(perceiver_dim, self.llm_dim, bias=False)
             self.source_gate_perc = nn.Parameter(torch.tensor(1.0))
             self.source_gate_csmp = nn.Parameter(torch.tensor(1.0))
             self.source_gate_policy = nn.Parameter(torch.tensor(1.0))
@@ -2250,12 +2216,10 @@ class GatedCrossAttention(nn.Module):
             self.structured_engineered_square_proj = None
             self.structured_global_perceiver_mlp = None
             self.structured_global_side_mlp = None
-            self.structured_router_stem = None
-            self.structured_square_weight_proj = None
-            self.structured_global_weight_proj = None
+            self.structured_square_k_proj = None
+            self.structured_global_k_proj = None
             self.text_gate_mlp = None
         else:
-            self.recurrent_query_proj = None
             self.perc_kv_norm = None
             self.perc_k_proj = None
             self.perc_v_proj = None
@@ -2269,27 +2233,30 @@ class GatedCrossAttention(nn.Module):
             self.register_parameter("source_gate_csmp", None)
             self.register_parameter("source_gate_policy", None)
 
-            self.structured_csmp_square_mlp = self._build_source_value_mlp(self.context_dim, dropout)
-            self.structured_perceiver_square_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
-            self.structured_policy_square_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
+            self.structured_csmp_square_mlp = (
+                self._build_source_value_mlp(self.context_dim, dropout)
+                if "csmp" in self.structured_square_source_names
+                else None
+            )
+            self.structured_perceiver_square_mlp = (
+                self._build_source_value_mlp(perceiver_dim, dropout)
+                if "perceiver" in self.structured_square_source_names
+                else None
+            )
+            self.structured_policy_square_mlp = (
+                self._build_source_value_mlp(perceiver_dim, dropout)
+                if "policy" in self.structured_square_source_names
+                else None
+            )
             self.structured_engineered_square_proj = (
                 self._build_engineered_value_proj(self.engineered_dim)
-                if self.use_engineered_source
+                if ("engineered" in self.structured_square_source_names)
                 else None
             )
             self.structured_global_perceiver_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
             self.structured_global_side_mlp = self._build_source_value_mlp(self.context_dim, dropout)
-            self.structured_router_stem = self._build_router_stem(
-                self.recurrent_query_state_dim + perceiver_dim,
-                dropout,
-            )
-            square_router_dim = 64 * self.structured_square_source_count
-            global_router_dim = 2
-            if self.structured_router_mode == "per_head":
-                square_router_dim *= self.n_heads
-                global_router_dim *= self.n_heads
-            self.structured_square_weight_proj = nn.Linear(self.llm_dim, square_router_dim)
-            self.structured_global_weight_proj = nn.Linear(self.llm_dim, global_router_dim)
+            self.structured_square_k_proj = nn.Linear(self.llm_dim, self.llm_dim, bias=False)
+            self.structured_global_k_proj = nn.Linear(self.llm_dim, self.llm_dim, bias=False)
             if self.text_gate_mode == "tanh_head":
                 self.text_gate_mlp = nn.Linear(self.llm_dim, self.n_heads)
                 nn.init.zeros_(self.text_gate_mlp.weight)
@@ -2297,7 +2264,7 @@ class GatedCrossAttention(nn.Module):
             else:
                 self.text_gate_mlp = None
 
-        self._last_recurrent_query_state: Optional[torch.Tensor] = None
+        self._last_query_states: Optional[torch.Tensor] = None
         self._last_source_weights: Optional[torch.Tensor] = None
         self._last_structured_metrics: Optional[Dict[str, torch.Tensor]] = None
         self._last_structured_square_sparse_loss: Optional[torch.Tensor] = None
@@ -2310,29 +2277,19 @@ class GatedCrossAttention(nn.Module):
         self.ffn_norm = nn.LayerNorm(llm_dim)
         ffn_hidden = llm_dim * ffn_mult
         self.ffn = nn.Sequential(
-            nn.Linear(llm_dim, ffn_hidden),
+            nn.Linear(self.llm_dim, ffn_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(ffn_hidden, llm_dim),
+            nn.Linear(ffn_hidden, self.llm_dim),
         )
         self.ffn_gate = nn.Parameter(torch.tensor(gate_init))
 
         self._last_text_gate: Optional[torch.Tensor] = None
-        self._last_recurrent_state: Optional[torch.Tensor] = None
-        self._last_recurrent_latent_delta_unscaled: Optional[torch.Tensor] = None
-        self._last_recurrent_latent_delta: Optional[torch.Tensor] = None
 
-    def _build_recurrent_head(self, output_dim: int) -> nn.Module:
-        return self._build_conditioning_head(self.recurrent_query_state_dim, output_dim)
-
-    def _build_conditioning_head(self, input_dim: int, output_dim: int) -> nn.Module:
-        if self.recurrent_query_use_mlp:
-            return nn.Sequential(
-                nn.Linear(input_dim, self.llm_dim),
-                nn.GELU(),
-                nn.Linear(self.llm_dim, output_dim),
-            )
-        return nn.Linear(input_dim, output_dim)
+    @classmethod
+    def _canonicalize_xattn_mode(cls, mode: str) -> str:
+        mode_str = str(mode)
+        return cls._MODE_ALIASES.get(mode_str, mode_str)
 
     def _build_source_value_mlp(self, input_dim: int, dropout: float) -> nn.Module:
         return nn.Sequential(
@@ -2383,16 +2340,6 @@ class GatedCrossAttention(nn.Module):
             return text_attention_mask.to(device=device, dtype=torch.bool)
         return torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
 
-    def _get_recurrent_query_gru(self) -> nn.GRU:
-        if self._shared_recurrent_query_gru_ref is not None:
-            shared = self._shared_recurrent_query_gru_ref()
-            if shared is None:
-                raise RuntimeError("Shared recurrent-query GRU reference is no longer valid.")
-            return shared
-        if self.recurrent_query_gru is None:
-            raise RuntimeError("recurrent_query_gru is not initialized.")
-        return self.recurrent_query_gru
-
     def _reshape_values_to_heads(self, values: torch.Tensor) -> torch.Tensor:
         batch_size, num_slots, _ = values.shape
         return values.view(batch_size, num_slots, self.n_heads, self.head_dim)
@@ -2410,6 +2357,25 @@ class GatedCrossAttention(nn.Module):
             effective_gate = torch.tanh(static_gate_logits + token_gate_logits)
         return effective_gate.to(dtype=dtype) * valid.unsqueeze(-1).to(dtype=dtype)
 
+    def _prepare_query(
+        self,
+        hidden_states: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        valid = self._build_valid_token_mask(
+            text_attention_mask,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=hidden_states.device,
+        )
+        query_states = self.query_norm(hidden_states)
+        query_states = query_states.masked_fill(~valid.unsqueeze(-1), 0.0)
+        self._last_query_states = query_states.detach()
+        q = self.q_proj(query_states).view(batch_size, seq_len, self.n_heads, self.head_dim)
+        q = q.transpose(1, 2).contiguous()
+        return query_states, q, valid
+
     def _source_cross_attn(
         self,
         q: torch.Tensor,
@@ -2418,16 +2384,29 @@ class GatedCrossAttention(nn.Module):
         k_proj: nn.Linear,
         v_proj: nn.Linear,
     ) -> torch.Tensor:
-        """Cross-attend recurrent queries to one source."""
-        B, _, _, _ = q.shape
-        k = k_proj(norm(kv_source))
-        v = v_proj(norm(kv_source))
-        k = k.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        """Cross-attend hidden-state queries to one source."""
+        k = self._reshape_values_to_heads(k_proj(norm(kv_source))).permute(0, 2, 1, 3).contiguous()
+        v = self._reshape_values_to_heads(v_proj(norm(kv_source))).permute(0, 2, 1, 3).contiguous()
         return F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
         )
+
+    def _manual_head_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_heads = k.permute(0, 2, 1, 3).contiguous()
+        v_heads = v.permute(0, 2, 1, 3).contiguous()
+        scores = torch.matmul(q, k_heads.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+        weights = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        mix_weights = weights
+        if self.training and self.attn_dropout.p > 0.0:
+            mix_weights = F.dropout(weights, p=self.attn_dropout.p)
+        mix = torch.matmul(mix_weights, v_heads)
+        return mix, weights
 
     def set_last_token_trace_capture(self, enabled: bool) -> None:
         self._capture_last_token_trace = bool(enabled)
@@ -2531,6 +2510,41 @@ class GatedCrossAttention(nn.Module):
             -(global_probs * global_probs.log()).sum(dim=-1) * valid_f.unsqueeze(-1)
         ).sum() / denom_per_head
 
+        gate_weights = effective_gates.detach().abs()
+        if router_heads == 1:
+            router_gate_weights = gate_weights.mean(dim=-1, keepdim=True)
+        elif gate_weights.size(-1) == router_heads:
+            router_gate_weights = gate_weights
+        else:
+            raise ValueError(
+                "Structured gate weights do not match router head count: "
+                f"gates={tuple(gate_weights.shape)}, router_heads={router_heads}"
+            )
+        router_gate_weights = router_gate_weights.to(dtype=slot_weights_per_head.dtype)
+        router_gate_weight_sums = router_gate_weights.sum(dim=(0, 1))
+        router_gate_weight_total = router_gate_weight_sums.sum()
+        gate_weighted_square_entropy = (
+            -(square_probs * square_probs.log()).sum(dim=-1) * router_gate_weights
+        ).sum() / denom_per_head
+        gate_weighted_square_entropy_norm = gate_weighted_square_entropy / max(
+            math.log(float(square_weights_per_head.size(-1))),
+            1e-12,
+        )
+        gate_weighted_square_mean_per_head = (
+            square_weights_per_head * router_gate_weights.unsqueeze(-1)
+        ).sum(dim=(0, 1)) / router_gate_weight_sums.clamp(min=1e-12).unsqueeze(-1)
+        gate_weighted_square_usage_entropy_per_head = -(
+            gate_weighted_square_mean_per_head.clamp_min(1e-12)
+            * gate_weighted_square_mean_per_head.clamp_min(1e-12).log()
+        ).sum(dim=-1)
+        gate_weighted_square_usage_entropy = (
+            gate_weighted_square_usage_entropy_per_head * router_gate_weight_sums
+        ).sum() / router_gate_weight_total.clamp(min=1e-12)
+        gate_weighted_square_usage_entropy_norm = gate_weighted_square_usage_entropy / max(
+            math.log(float(square_mean_per_head.size(-1))),
+            1e-12,
+        )
+
         valid_gate_mask = valid.unsqueeze(-1).expand_as(effective_gates)
         masked_effective_gates = effective_gates.masked_select(valid_gate_mask)
         effective_gate_abs_mean_per_head = (
@@ -2558,8 +2572,8 @@ class GatedCrossAttention(nn.Module):
             token_gate_logit_mean_per_head = effective_gates.new_zeros(self.n_heads)
             token_gate_logit_mean = effective_gates.new_tensor(0.0)
 
-        self._last_structured_square_sparse_loss = square_entropy_norm
-        self._last_structured_square_usage_entropy_norm = square_usage_entropy_norm
+        self._last_structured_square_sparse_loss = gate_weighted_square_entropy_norm
+        self._last_structured_square_usage_entropy_norm = gate_weighted_square_usage_entropy_norm
         self._last_structured_gate_usage_mean_abs = effective_gate_abs_mean
         self._last_structured_metrics = {
             "router_mode": self.structured_router_mode,
@@ -2576,8 +2590,10 @@ class GatedCrossAttention(nn.Module):
             "square_mean_per_head": square_mean_per_head.detach(),
             "square_entropy": square_entropy.detach(),
             "square_entropy_norm": square_entropy_norm.detach(),
+            "gate_weighted_square_entropy_norm": gate_weighted_square_entropy_norm.detach(),
             "square_usage_entropy": square_usage_entropy.detach(),
             "square_usage_entropy_norm": square_usage_entropy_norm.detach(),
+            "gate_weighted_square_usage_entropy_norm": gate_weighted_square_usage_entropy_norm.detach(),
             "max_square_index": max_square_index.detach(),
             "max_square_mass": square_mean[max_square_index].detach(),
             "global_mean": global_mean.detach(),
@@ -2775,7 +2791,7 @@ class GatedCrossAttention(nn.Module):
 
         self._last_token_trace = trace
 
-    def _forward_recurrent_query_mode(
+    def _forward_cross_attn_mode(
         self,
         hidden_states: torch.Tensor,
         perceiver_latents: torch.Tensor,
@@ -2783,23 +2799,10 @@ class GatedCrossAttention(nn.Module):
         text_attention_mask: Optional[torch.Tensor],
         policy_latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Direct recurrent-query xattn over policy/perceiver/csmp sources."""
+        """Direct hidden-state cross-attention over policy / perceiver / CSMP sources."""
         self._last_token_trace = None
         B, S, _ = hidden_states.shape
-
-        rq_in = self.recurrent_query_norm(hidden_states)
-        rq_state, _ = self._get_recurrent_query_gru()(rq_in)  # (B, S, D_state)
-        if (
-            text_attention_mask is not None
-            and text_attention_mask.dim() == 2
-            and text_attention_mask.shape[0] == B
-            and text_attention_mask.shape[1] == S
-        ):
-            valid = text_attention_mask.to(device=rq_state.device, dtype=torch.bool)
-            rq_state = rq_state.masked_fill(~valid.unsqueeze(-1), 0.0)
-        self._last_recurrent_query_state = rq_state.detach()
-
-        q = self.recurrent_query_proj(rq_state).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        _query_states, q, valid = self._prepare_query(hidden_states, text_attention_mask)
 
         out_terms: List[torch.Tensor] = []
         weight_terms: List[torch.Tensor] = []
@@ -2846,8 +2849,9 @@ class GatedCrossAttention(nn.Module):
             return hidden_states
 
         self._last_source_weights = torch.stack(weight_terms)
-        attn_out = torch.stack(out_terms, dim=0).sum(dim=0)  # (B, H, S, D_h)
+        attn_out = torch.stack(out_terms, dim=0).sum(dim=0)
         attn_out = torch.tanh(self.gate) * attn_out
+        attn_out = attn_out * valid.unsqueeze(1).unsqueeze(-1).to(dtype=attn_out.dtype)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.llm_dim)
         attn_out = self.o_proj(attn_out)
         hidden_states = hidden_states + attn_out
@@ -2857,7 +2861,7 @@ class GatedCrossAttention(nn.Module):
         hidden_states = residual + torch.tanh(self.ffn_gate) * ffn_out
         return hidden_states
 
-    def _forward_structured_square_mixer_mode(
+    def _forward_structured_cross_attn_mode(
         self,
         hidden_states: torch.Tensor,
         perceiver_latents: torch.Tensor,
@@ -2867,12 +2871,8 @@ class GatedCrossAttention(nn.Module):
         policy_latents: Optional[torch.Tensor],
         engineered_square_features: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if (
-            self.structured_router_stem is None
-            or self.structured_square_weight_proj is None
-            or self.structured_global_weight_proj is None
-        ):
-            raise RuntimeError("structured_square_mixer mode is not initialized on this layer.")
+        if self.structured_square_k_proj is None or self.structured_global_k_proj is None:
+            raise RuntimeError("structured_cross_attn mode is not initialized on this layer.")
 
         self._last_structured_metrics = None
         self._last_structured_square_sparse_loss = None
@@ -2882,66 +2882,68 @@ class GatedCrossAttention(nn.Module):
         self._require_rank3("perceiver_latents", perceiver_latents)
         if perceiver_latents.size(1) < 65:
             raise ValueError(
-                "structured_square_mixer requires perceiver_latents with 65 tokens "
+                "structured_cross_attn requires perceiver_latents with 65 tokens "
                 f"(64 squares + global), got {perceiver_latents.size(1)}"
             )
         if context is None:
-            raise ValueError("structured_square_mixer requires context so the side token global path is available")
+            raise ValueError("structured_cross_attn requires context so the side token global path is available")
         self._require_rank3("context", context)
         if context.size(1) < 1:
-            raise ValueError("structured_square_mixer requires context to include the side token")
-        if csmp_square_tokens is None:
-            raise ValueError("structured_square_mixer requires csmp_square_tokens")
-        if policy_latents is None:
-            raise ValueError("structured_square_mixer requires policy_latents")
+            raise ValueError("structured_cross_attn requires context to include the side token")
+        if "csmp" in self.structured_square_source_names and csmp_square_tokens is None:
+            raise ValueError("structured_cross_attn requires csmp_square_tokens")
+        if "policy" in self.structured_square_source_names and policy_latents is None:
+            raise ValueError("structured_cross_attn requires policy_latents")
 
-        self._require_rank3("csmp_square_tokens", csmp_square_tokens)
-        self._require_square_count("csmp_square_tokens", csmp_square_tokens, expected=64)
-        self._require_rank3("policy_latents", policy_latents)
-        self._require_square_count("policy_latents", policy_latents, expected=64)
-        if self.use_engineered_source:
+        if "csmp" in self.structured_square_source_names:
+            self._require_rank3("csmp_square_tokens", csmp_square_tokens)
+            self._require_square_count("csmp_square_tokens", csmp_square_tokens, expected=64)
+        if "policy" in self.structured_square_source_names:
+            self._require_rank3("policy_latents", policy_latents)
+            self._require_square_count("policy_latents", policy_latents, expected=64)
+        if "engineered" in self.structured_square_source_names:
             if engineered_square_features is None:
                 raise ValueError(
-                    "structured_square_mixer with use_engineered_source=True "
+                    "structured_cross_attn with an engineered square source "
                     "requires engineered_square_features"
                 )
             self._require_rank3("engineered_square_features", engineered_square_features)
             self._require_square_count("engineered_square_features", engineered_square_features, expected=64)
 
         B, S, _ = hidden_states.shape
-        rq_in = self.recurrent_query_norm(hidden_states)
-        rq_state, _ = self._get_recurrent_query_gru()(rq_in)  # (B, S, D_state)
-        valid = self._build_valid_token_mask(text_attention_mask, batch_size=B, seq_len=S, device=rq_state.device)
-        rq_state = rq_state.masked_fill(~valid.unsqueeze(-1), 0.0)
-        self._last_recurrent_query_state = rq_state.detach()
+        query_states, q, valid = self._prepare_query(hidden_states, text_attention_mask)
         self._last_source_weights = None
 
-        global_perceiver_latent = perceiver_latents[:, 64, :]
-        global_perceiver_cond = global_perceiver_latent.unsqueeze(1).expand(-1, S, -1)
-        router_inputs = torch.cat([rq_state, global_perceiver_cond], dim=-1)
-        router_hidden = self.structured_router_stem(router_inputs)
-        square_logits = self.structured_square_weight_proj(router_hidden)
-        global_logits = self.structured_global_weight_proj(router_hidden)
         token_gate_logits: Optional[torch.Tensor]
         if self.text_gate_mlp is not None:
-            token_gate_logits = self.text_gate_mlp(router_hidden)
+            token_gate_logits = self.text_gate_mlp(query_states)
         else:
             token_gate_logits = None
 
-        square_value_parts = [
-            self.structured_csmp_square_mlp(csmp_square_tokens),
-            self.structured_perceiver_square_mlp(perceiver_latents[:, :64, :]),
-            self.structured_policy_square_mlp(policy_latents),
-        ]
-        if self.use_engineered_source:
+        square_value_parts = []
+        if "csmp" in self.structured_square_source_names:
+            if self.structured_csmp_square_mlp is None:
+                raise RuntimeError("structured CSMP square source is not initialized.")
+            square_value_parts.append(self.structured_csmp_square_mlp(csmp_square_tokens))
+        if "perceiver" in self.structured_square_source_names:
+            if self.structured_perceiver_square_mlp is None:
+                raise RuntimeError("structured perceiver square source is not initialized.")
+            square_value_parts.append(self.structured_perceiver_square_mlp(perceiver_latents[:, :64, :]))
+        if "policy" in self.structured_square_source_names:
+            if self.structured_policy_square_mlp is None:
+                raise RuntimeError("structured policy square source is not initialized.")
+            square_value_parts.append(self.structured_policy_square_mlp(policy_latents))
+        if "engineered" in self.structured_square_source_names:
             if self.structured_engineered_square_proj is None:
                 raise RuntimeError("structured engineered square source is not initialized.")
-            square_value_parts.append(
-                self.structured_engineered_square_proj(engineered_square_features)
-            )
+            square_value_parts.append(self.structured_engineered_square_proj(engineered_square_features))
+        if not square_value_parts:
+            raise RuntimeError("structured_cross_attn has no active square sources.")
         square_values = torch.cat(square_value_parts, dim=1)
         square_values_heads = self._reshape_values_to_heads(square_values)
+        square_keys_heads = self._reshape_values_to_heads(self.structured_square_k_proj(square_values))
 
+        global_perceiver_latent = perceiver_latents[:, 64, :]
         global_values = torch.stack(
             [
                 self.structured_global_perceiver_mlp(global_perceiver_latent),
@@ -2950,21 +2952,20 @@ class GatedCrossAttention(nn.Module):
             dim=1,
         )  # (B, 2, llm_dim)
         global_values_heads = self._reshape_values_to_heads(global_values)
+        global_keys_heads = self._reshape_values_to_heads(self.structured_global_k_proj(global_values))
 
-        if self.structured_router_mode == "per_head":
-            square_logits = square_logits.view(B, S, self.n_heads, 64 * self.structured_square_source_count)
-            square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
-            square_mix = torch.einsum("bshn,bnhd->bshd", square_weights, square_values_heads)
-
-            global_logits = global_logits.view(B, S, self.n_heads, 2)
-            global_weights = torch.softmax(global_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
-            global_mix = torch.einsum("bshg,bghd->bshd", global_weights, global_values_heads)
-        else:
-            square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
-            square_mix = torch.einsum("bsn,bnhd->bshd", square_weights, square_values_heads)
-
-            global_weights = torch.softmax(global_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
-            global_mix = torch.einsum("bsg,bghd->bshd", global_weights, global_values_heads)
+        square_mix, square_weights_heads = self._manual_head_attention(
+            q=q,
+            k=square_keys_heads,
+            v=square_values_heads,
+        )
+        global_mix, global_weights_heads = self._manual_head_attention(
+            q=q,
+            k=global_keys_heads,
+            v=global_values_heads,
+        )
+        square_weights = square_weights_heads.permute(0, 2, 1, 3).contiguous()
+        global_weights = global_weights_heads.permute(0, 2, 1, 3).contiguous()
 
         effective_gates = self._compute_effective_structured_gate(
             valid=valid,
@@ -2994,8 +2995,10 @@ class GatedCrossAttention(nn.Module):
             global_values_heads=global_values_heads,
         )
 
-        attn_out = (square_mix + global_mix) * effective_gates.unsqueeze(-1)
-        attn_out = attn_out.contiguous().view(B, S, self.llm_dim)
+        attn_out = (square_mix + global_mix) * effective_gates.permute(0, 2, 1).unsqueeze(-1)
+        # square_mix/global_mix are (B, H, S, D); transpose heads behind sequence
+        # before flattening so each token only receives its own per-head output.
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.llm_dim)
         attn_out = self.o_proj(attn_out)
         hidden_states = hidden_states + attn_out
 
@@ -3025,8 +3028,8 @@ class GatedCrossAttention(nn.Module):
         Returns:
             (B, S, llm_dim) gated cross-attended hidden states
         """
-        if self.xattn_mode == "structured_square_mixer":
-            return self._forward_structured_square_mixer_mode(
+        if self.xattn_mode == "structured_cross_attn":
+            return self._forward_structured_cross_attn_mode(
                 hidden_states=hidden_states,
                 perceiver_latents=perceiver_latents,
                 context=context,
@@ -3041,7 +3044,7 @@ class GatedCrossAttention(nn.Module):
         self._last_structured_square_usage_entropy_norm = None
         self._last_structured_gate_usage_mean_abs = None
         self._last_text_gate = None
-        return self._forward_recurrent_query_mode(
+        return self._forward_cross_attn_mode(
             hidden_states=hidden_states,
             perceiver_latents=perceiver_latents,
             context=context,
@@ -3471,24 +3474,55 @@ class ChessFusionAdapter(nn.Module):
         )
         self.enable_lm_pseudotokens = bool(getattr(cfg, 'enable_lm_pseudotokens', True))
         self.num_lm_pseudotokens = int(getattr(cfg, 'num_lm_pseudotokens', 0)) if self.enable_lm_pseudotokens else 0
-        self.xattn_mode = str(getattr(cfg, 'xattn_mode', 'recurrent_query_attn'))
-        self.xattn_structured_router_mode = str(getattr(cfg, 'xattn_structured_router_mode', 'shared'))
+        raw_xattn_mode = str(getattr(cfg, 'xattn_mode', 'cross_attn'))
+        self.xattn_mode = GatedCrossAttention._canonicalize_xattn_mode(raw_xattn_mode)
+        if raw_xattn_mode != self.xattn_mode:
+            print(
+                f"  WARNING: chess_fusion.xattn_mode={raw_xattn_mode!r} is deprecated; "
+                f"using {self.xattn_mode!r}"
+            )
+        self.xattn_structured_router_mode = str(getattr(cfg, 'xattn_structured_router_mode', 'per_head'))
         self.xattn_text_gate_mode = str(getattr(cfg, 'xattn_text_gate_mode', 'tanh_head'))
         self.xattn_structured_use_engineered_source = bool(
             getattr(cfg, 'xattn_structured_use_engineered_source', False)
         )
+        self.engineered_only_xattn_ablation = bool(
+            getattr(cfg, 'engineered_only_xattn_ablation', False)
+        )
         self.xattn_recurrent_query_share_gru_across_layers = bool(
             getattr(cfg, 'xattn_recurrent_query_share_gru_across_layers', False)
         )
-
-        self.shared_recurrent_query_gru: Optional[nn.GRU] = None
+        if self.xattn_structured_router_mode == "shared":
+            print(
+                "  WARNING: chess_fusion.xattn_structured_router_mode='shared' is deprecated; "
+                "structured_cross_attn always uses per-head attention"
+            )
+            self.xattn_structured_router_mode = "per_head"
+        if getattr(cfg, 'xattn_recurrent_query_state_dim', 256) != 256:
+            print("  WARNING: chess_fusion.xattn_recurrent_query_state_dim is deprecated and ignored")
+        if bool(getattr(cfg, 'xattn_recurrent_query_use_mlp', False)):
+            print("  WARNING: chess_fusion.xattn_recurrent_query_use_mlp is deprecated and ignored")
         if self.xattn_recurrent_query_share_gru_across_layers:
-            rq_dim = int(getattr(cfg, 'xattn_recurrent_query_state_dim', 256))
-            self.shared_recurrent_query_gru = nn.GRU(
-                input_size=self.llm_dim,
-                hidden_size=rq_dim,
-                num_layers=1,
-                batch_first=True,
+            print(
+                "  WARNING: chess_fusion.xattn_recurrent_query_share_gru_across_layers "
+                "is deprecated and ignored"
+            )
+            self.xattn_recurrent_query_share_gru_across_layers = False
+        if self.engineered_only_xattn_ablation and self.enable_lm_prepend_latents:
+            print(
+                "  WARNING: engineered_only_xattn_ablation ignores lm_prepend_latents; "
+                "forcing them off for a pure x-attn ablation"
+            )
+            self.enable_lm_prepend_latents = False
+            self.num_lm_prepend_latents = 0
+        if self.engineered_only_xattn_ablation and self.enable_lm_pseudotokens and self.num_lm_pseudotokens > 0:
+            print(
+                "  WARNING: engineered_only_xattn_ablation is running with "
+                "LM pseudotokens enabled. These pseudotokens are static learned "
+                "KV memory, not board-conditioned context, so they can provide a "
+                "shortcut that drives teacher-forced LM loss down without improving "
+                "grounded chess accuracy. Disable enable_lm_pseudotokens for a "
+                "clean engineered-only x-attn ablation."
             )
 
         if self.backbone_init not in {'maia_pretrained', 'random'}:
@@ -3533,10 +3567,10 @@ class ChessFusionAdapter(nn.Module):
                     "chess_fusion.lm_prepend_latent_mode='structured_mlp' requires "
                     "use_structured_policy_head=True"
                 )
-        if self.xattn_mode not in {'recurrent_query_attn', 'structured_square_mixer'}:
+        if self.xattn_mode not in {'cross_attn', 'structured_cross_attn'}:
             raise ValueError(
                 "chess_fusion.xattn_mode must be one of "
-                "{'recurrent_query_attn', 'structured_square_mixer'} "
+                "{'cross_attn', 'structured_cross_attn'} "
                 f"(got {self.xattn_mode!r})"
             )
         if self.xattn_structured_router_mode not in {'shared', 'per_head'}:
@@ -3551,29 +3585,58 @@ class ChessFusionAdapter(nn.Module):
                 "{'none', 'tanh_head'} "
                 f"(got {self.xattn_text_gate_mode!r})"
             )
-        if self.xattn_structured_use_engineered_source and self.xattn_mode != 'structured_square_mixer':
+        if self.xattn_structured_use_engineered_source and self.xattn_mode != 'structured_cross_attn':
             raise ValueError(
                 "chess_fusion.xattn_structured_use_engineered_source=True requires "
-                "xattn_mode='structured_square_mixer'"
+                "xattn_mode='structured_cross_attn'"
             )
-        if self.xattn_mode == 'structured_square_mixer':
-            if not self.structured_latents:
+        if self.engineered_only_xattn_ablation:
+            if self.xattn_mode != 'structured_cross_attn':
                 raise ValueError(
-                    "chess_fusion.xattn_mode='structured_square_mixer' requires structured_latents=True"
+                    "chess_fusion.engineered_only_xattn_ablation=True requires "
+                    "xattn_mode='structured_cross_attn'"
                 )
-            if cfg.num_latents != 65:
+            if bool(getattr(cfg, 'use_engineered_concat', False)):
                 raise ValueError(
-                    "chess_fusion.xattn_mode='structured_square_mixer' requires num_latents=65 "
-                    f"(got {cfg.num_latents})"
+                    "chess_fusion.engineered_only_xattn_ablation=True requires "
+                    "use_engineered_concat=False"
                 )
-            if not bool(getattr(cfg, 'use_chess_structure_mp', False)):
+            disallowed_aux = []
+            for key in (
+                'aux_policy_weight',
+                'aux_eval_weight',
+                'aux_move_eval_weight',
+                'bsr_weight',
+                'spp_weight',
+            ):
+                value = float(getattr(cfg, key, 0.0))
+                if value > 0:
+                    disallowed_aux.append(f"{key}={value}")
+            if disallowed_aux:
                 raise ValueError(
-                    "chess_fusion.xattn_mode='structured_square_mixer' requires use_chess_structure_mp=True"
+                    "chess_fusion.engineered_only_xattn_ablation=True requires "
+                    "adapter auxiliary losses to be disabled, got "
+                    + ", ".join(disallowed_aux)
                 )
-            if not bool(getattr(cfg, 'use_structured_policy_head', False)):
-                raise ValueError(
-                    "chess_fusion.xattn_mode='structured_square_mixer' requires use_structured_policy_head=True"
-                )
+        if self.xattn_mode == 'structured_cross_attn':
+            if not self.engineered_only_xattn_ablation:
+                if not self.structured_latents:
+                    raise ValueError(
+                        "chess_fusion.xattn_mode='structured_cross_attn' requires structured_latents=True"
+                    )
+                if cfg.num_latents != 65:
+                    raise ValueError(
+                        "chess_fusion.xattn_mode='structured_cross_attn' requires num_latents=65 "
+                        f"(got {cfg.num_latents})"
+                    )
+                if not bool(getattr(cfg, 'use_chess_structure_mp', False)):
+                    raise ValueError(
+                        "chess_fusion.xattn_mode='structured_cross_attn' requires use_chess_structure_mp=True"
+                    )
+                if not bool(getattr(cfg, 'use_structured_policy_head', False)):
+                    raise ValueError(
+                        "chess_fusion.xattn_mode='structured_cross_attn' requires use_structured_policy_head=True"
+                    )
         self._warn_ignored_structured_readout_settings()
         # Store freeze flags as instance attributes for live control
         self.freeze_cnn = cfg.freeze_cnn
@@ -3583,9 +3646,28 @@ class ChessFusionAdapter(nn.Module):
         self.freeze_xattn = cfg.freeze_xattn
         self.freeze_prepend_latents = getattr(cfg, 'freeze_prepend_latents', False)
         self.freeze_lm_pseudotokens = getattr(cfg, 'freeze_lm_pseudotokens', False)
+        self.xattn_layer_indices = list(cfg.xattn_layers)
+        raw_pseudotoken_layers = getattr(cfg, 'lm_pseudotoken_layers', None)
+        if raw_pseudotoken_layers is None:
+            self.pseudotoken_layer_indices = list(self.xattn_layer_indices)
+        else:
+            self.pseudotoken_layer_indices = [int(i) for i in raw_pseudotoken_layers]
+        if not self.enable_lm_pseudotokens or self.num_lm_pseudotokens <= 0:
+            self.pseudotoken_layer_indices = []
+        self.backbone = None
+        self.teacher_backbone = None
+        self.multi_scale = None
+        self.perceiver = None
+        self.shared_readout = None
+        self.prepend_latent_readout: Optional[PrependLatentReadout] = None
+        self.bsr_head = None
+        self.spp_head = None
+        self.spp_mask_builder = None
 
         # Maia backbone (only when CNN is enabled)
-        if self.use_cnn:
+        if self.engineered_only_xattn_ablation:
+            print("  [ChessFusion] Engineered-only structured x-attn ablation enabled")
+        elif self.use_cnn:
             class _BackboneConfig:
                 class maia:
                     model_type = cfg.model_type
@@ -3618,7 +3700,7 @@ class ChessFusionAdapter(nn.Module):
 
         # Build CSMP config dict if enabled
         csmp_config = None
-        if getattr(cfg, 'use_chess_structure_mp', False):
+        if (not self.engineered_only_xattn_ablation) and getattr(cfg, 'use_chess_structure_mp', False):
             csmp_config = {
                 'csmp_dim': getattr(cfg, 'csmp_dim', 1024),
                 'csmp_pos_dim': getattr(cfg, 'csmp_pos_dim', 32),
@@ -3636,83 +3718,55 @@ class ChessFusionAdapter(nn.Module):
                 'csmp_ablation_no_mask': getattr(cfg, 'csmp_ablation_no_mask', False),
             }
 
-        # Multi-scale feature extractor
-        self.multi_scale = MultiScaleFeatureExtractor(
-            self.backbone,
-            tap_dim=cfg.tap_projection_dim,
-            cnn_tap_layers=getattr(cfg, 'cnn_tap_layers', None),
-            concat_cnn_taps=getattr(cfg, 'concat_cnn_taps', False),
-            use_transformer_taps=cfg.use_transformer_taps,
-            use_cnn=self.use_cnn,
-            csmp_config=csmp_config,
-        )
-
-        # Square Latent Encoder
-        self.perceiver = SquareLatentEncoder(
-            tap_dim=cfg.tap_projection_dim,
-            perceiver_dim=cfg.perceiver_dim,
-            num_latents=cfg.num_latents,
-            depth=cfg.perceiver_depth,
-            heads=cfg.perceiver_heads,
-            num_fusion_tokens=cfg.num_fusion_tokens,
-            num_eval_buckets=cfg.num_eval_buckets,
-            enable_eval_head=bool(getattr(cfg, "aux_eval_weight", 0.0) > 0),
-            use_engineered_concat=cfg.use_engineered_concat,
-            dropout=getattr(cfg, 'perceiver_dropout', 0.1),
-            structured_latents=self.structured_latents,
-            latent_context_mask_type=getattr(cfg, 'latent_context_mask_type', 'full'),
-            global_latent_attends_all=getattr(cfg, 'global_latent_attends_all', True),
-            square_latent_attends_side_token=getattr(cfg, 'square_latent_attends_side_token', True),
-            use_structured_policy_head=getattr(cfg, 'use_structured_policy_head', False),
-            policy_include_global_latent=self.square_heads_include_global_latent,
-            structured_policy_query_layers=getattr(cfg, 'structured_policy_query_layers', 4),
-            structured_policy_query_heads=getattr(cfg, 'structured_policy_query_heads', None),
-            structured_policy_ffn_mult=getattr(cfg, 'structured_policy_ffn_mult', 2),
-            structured_policy_use_move_bias=getattr(cfg, 'structured_policy_use_move_bias', True),
-        )
-
-        # Shared layer-conditioned readout (legacy recurrent-query mode only)
-        self.xattn_layer_indices = list(cfg.xattn_layers)
-        raw_pseudotoken_layers = getattr(cfg, 'lm_pseudotoken_layers', None)
-        if raw_pseudotoken_layers is None:
-            self.pseudotoken_layer_indices = list(self.xattn_layer_indices)
-        else:
-            self.pseudotoken_layer_indices = [int(i) for i in raw_pseudotoken_layers]
-        if not self.enable_lm_pseudotokens or self.num_lm_pseudotokens <= 0:
-            self.pseudotoken_layer_indices = []
-        self.shared_readout: Optional[SharedLayerReadout] = None
-        if self.xattn_mode == 'recurrent_query_attn':
-            self.shared_readout = SharedLayerReadout(
-                num_latents=cfg.num_fusion_tokens,
-                perceiver_dim=cfg.perceiver_dim,
-                llm_dim=self.llm_dim,
-                context_dim=cfg.tap_projection_dim,
-                heads=cfg.perceiver_heads,
-                ffn_mult=getattr(cfg, 'xattn_ffn_mult', 2),
-                dropout=getattr(cfg, 'xattn_dropout', 0.1),
-                depth=getattr(cfg, 'readout_depth', 1),
-                fourier_dim=getattr(cfg, 'shared_readout_fourier_dim', 64),
-                use_text_conditioning=False,
-                use_policy_latent_cross_attention=bool(
-                    getattr(cfg, 'readout_use_policy_latent_cross_attention', False)
-                ),
-                recurrent_text_state_enabled=False,
-                recurrent_text_state_dim=256,
+        if not self.engineered_only_xattn_ablation:
+            # Multi-scale feature extractor
+            self.multi_scale = MultiScaleFeatureExtractor(
+                self.backbone,
+                tap_dim=cfg.tap_projection_dim,
+                cnn_tap_layers=getattr(cfg, 'cnn_tap_layers', None),
+                concat_cnn_taps=getattr(cfg, 'concat_cnn_taps', False),
+                use_transformer_taps=cfg.use_transformer_taps,
+                use_cnn=self.use_cnn,
+                csmp_config=csmp_config,
             )
 
-        self.prepend_latent_readout: Optional[PrependLatentReadout] = None
-        if self.enable_lm_prepend_latents:
-            self.prepend_latent_readout = PrependLatentReadout(
-                num_prepend_latents=self.num_lm_prepend_latents,
+            # Square Latent Encoder
+            self.perceiver = SquareLatentEncoder(
+                tap_dim=cfg.tap_projection_dim,
                 perceiver_dim=cfg.perceiver_dim,
-                context_dim=cfg.tap_projection_dim,
-                llm_dim=self.llm_dim,
+                num_latents=cfg.num_latents,
+                depth=cfg.perceiver_depth,
                 heads=cfg.perceiver_heads,
-                policy_dim=cfg.perceiver_dim,
-                mode=self.lm_prepend_latent_mode,
-                structured_mlp_hidden_dim=self.lm_prepend_structured_mlp_hidden_dim,
-                dropout=getattr(cfg, 'xattn_dropout', 0.1),
+                num_fusion_tokens=cfg.num_fusion_tokens,
+                num_eval_buckets=cfg.num_eval_buckets,
+                enable_eval_head=bool(getattr(cfg, "aux_eval_weight", 0.0) > 0),
+                use_engineered_concat=cfg.use_engineered_concat,
+                engineered_dim=ENGINEERED_FEATURE_DIM,
+                dropout=getattr(cfg, 'perceiver_dropout', 0.1),
+                structured_latents=self.structured_latents,
+                latent_context_mask_type=getattr(cfg, 'latent_context_mask_type', 'full'),
+                global_latent_attends_all=getattr(cfg, 'global_latent_attends_all', True),
+                square_latent_attends_side_token=getattr(cfg, 'square_latent_attends_side_token', True),
+                use_structured_policy_head=getattr(cfg, 'use_structured_policy_head', False),
+                policy_include_global_latent=self.square_heads_include_global_latent,
+                structured_policy_query_layers=getattr(cfg, 'structured_policy_query_layers', 4),
+                structured_policy_query_heads=getattr(cfg, 'structured_policy_query_heads', None),
+                structured_policy_ffn_mult=getattr(cfg, 'structured_policy_ffn_mult', 2),
+                structured_policy_use_move_bias=getattr(cfg, 'structured_policy_use_move_bias', True),
             )
+
+            if self.enable_lm_prepend_latents:
+                self.prepend_latent_readout = PrependLatentReadout(
+                    num_prepend_latents=self.num_lm_prepend_latents,
+                    perceiver_dim=cfg.perceiver_dim,
+                    context_dim=cfg.tap_projection_dim,
+                    llm_dim=self.llm_dim,
+                    heads=cfg.perceiver_heads,
+                    policy_dim=cfg.perceiver_dim,
+                    mode=self.lm_prepend_latent_mode,
+                    structured_mlp_hidden_dim=self.lm_prepend_structured_mlp_hidden_dim,
+                    dropout=getattr(cfg, 'xattn_dropout', 0.1),
+                )
 
         # Gated cross-attention modules (created here, injected into LLM later)
         # Each module references the shared readout (set in inject_into_llm).
@@ -3721,6 +3775,7 @@ class ChessFusionAdapter(nn.Module):
                 llm_dim=self.llm_dim,
                 perceiver_dim=cfg.perceiver_dim,
                 context_dim=cfg.tap_projection_dim,
+                engineered_dim=ENGINEERED_FEATURE_DIM,
                 num_fusion_tokens=cfg.num_fusion_tokens,
                 n_heads=cfg.xattn_heads,
                 ffn_mult=getattr(cfg, 'xattn_ffn_mult', 2),
@@ -3728,11 +3783,12 @@ class ChessFusionAdapter(nn.Module):
                 dropout=getattr(cfg, 'xattn_dropout', 0.1),
                 recurrent_query_state_dim=int(getattr(cfg, 'xattn_recurrent_query_state_dim', 256)),
                 recurrent_query_use_mlp=bool(getattr(cfg, 'xattn_recurrent_query_use_mlp', False)),
-                shared_recurrent_query_gru=self.shared_recurrent_query_gru,
+                shared_recurrent_query_gru=None,
                 xattn_mode=self.xattn_mode,
                 structured_router_mode=self.xattn_structured_router_mode,
                 text_gate_mode=self.xattn_text_gate_mode,
                 use_engineered_source=self.xattn_structured_use_engineered_source,
+                engineered_only_ablation=self.engineered_only_xattn_ablation,
             )
             for _ in self.xattn_layer_indices
         ])
@@ -3747,37 +3803,38 @@ class ChessFusionAdapter(nn.Module):
             for _ in self.pseudotoken_layer_indices
         ])
 
-        # --- BSR / SPP self-supervised auxiliary heads ---
-        # Always create heads so they can be enabled/disabled mid-training
-        # via live controller weight changes. Only run in forward() when weight > 0.
-        self.bsr_head = AuxSquareHead(
-            perceiver_dim=cfg.perceiver_dim,
-            head_dim=getattr(cfg, 'bsr_dim', 256),
-            output_dim=13,  # 12 piece types + empty
-            n_heads=getattr(cfg, 'bsr_heads', 4),
-            n_layers=getattr(cfg, 'bsr_layers', 2),
-            dropout=getattr(cfg, 'bsr_dropout', 0.1),
-            structured_mode=self.structured_latents,
-            include_global_latent=self.square_heads_include_global_latent,
-        )
-        bsr_w = getattr(cfg, 'bsr_weight', 0.0)
-        print(f"  BSR head: dim={cfg.bsr_dim}, heads={cfg.bsr_heads}, "
-              f"layers={cfg.bsr_layers}, weight={bsr_w}{' (disabled)' if bsr_w == 0 else ''}")
+        if not self.engineered_only_xattn_ablation:
+            # --- BSR / SPP self-supervised auxiliary heads ---
+            # Always create heads so they can be enabled/disabled mid-training
+            # via live controller weight changes. Only run in forward() when weight > 0.
+            self.bsr_head = AuxSquareHead(
+                perceiver_dim=cfg.perceiver_dim,
+                head_dim=getattr(cfg, 'bsr_dim', 256),
+                output_dim=13,  # 12 piece types + empty
+                n_heads=getattr(cfg, 'bsr_heads', 4),
+                n_layers=getattr(cfg, 'bsr_layers', 2),
+                dropout=getattr(cfg, 'bsr_dropout', 0.1),
+                structured_mode=self.structured_latents,
+                include_global_latent=self.square_heads_include_global_latent,
+            )
+            bsr_w = getattr(cfg, 'bsr_weight', 0.0)
+            print(f"  BSR head: dim={cfg.bsr_dim}, heads={cfg.bsr_heads}, "
+                  f"layers={cfg.bsr_layers}, weight={bsr_w}{' (disabled)' if bsr_w == 0 else ''}")
 
-        self.spp_head = AuxSquareHead(
-            perceiver_dim=cfg.perceiver_dim,
-            head_dim=getattr(cfg, 'spp_dim', 256),
-            output_dim=10,  # 2 attack counts + 8 ray distances
-            n_heads=getattr(cfg, 'spp_heads', 4),
-            n_layers=getattr(cfg, 'spp_layers', 2),
-            dropout=getattr(cfg, 'spp_dropout', 0.1),
-            structured_mode=self.structured_latents,
-            include_global_latent=self.square_heads_include_global_latent,
-        )
-        self.spp_mask_builder = DynamicMaskBuilder()
-        spp_w = getattr(cfg, 'spp_weight', 0.0)
-        print(f"  SPP head: dim={cfg.spp_dim}, heads={cfg.spp_heads}, "
-              f"layers={cfg.spp_layers}, weight={spp_w}{' (disabled)' if spp_w == 0 else ''}")
+            self.spp_head = AuxSquareHead(
+                perceiver_dim=cfg.perceiver_dim,
+                head_dim=getattr(cfg, 'spp_dim', 256),
+                output_dim=10,  # 2 attack counts + 8 ray distances
+                n_heads=getattr(cfg, 'spp_heads', 4),
+                n_layers=getattr(cfg, 'spp_layers', 2),
+                dropout=getattr(cfg, 'spp_dropout', 0.1),
+                structured_mode=self.structured_latents,
+                include_global_latent=self.square_heads_include_global_latent,
+            )
+            self.spp_mask_builder = DynamicMaskBuilder()
+            spp_w = getattr(cfg, 'spp_weight', 0.0)
+            print(f"  SPP head: dim={cfg.spp_dim}, heads={cfg.spp_heads}, "
+                  f"layers={cfg.spp_layers}, weight={spp_w}{' (disabled)' if spp_w == 0 else ''}")
 
         # Apply backbone freezing (only when backbone exists)
         if self.use_cnn and (self.freeze_cnn or self.freeze_transformer):
@@ -3811,23 +3868,20 @@ class ChessFusionAdapter(nn.Module):
         print(f"  Trainable params: {trainable:,}")
         print(f"  Student backbone init: {self.backbone_init}")
         print(f"  Objective policy teacher: {self.teacher_backbone is not None}")
-        print(f"  Perceiver: {self.cfg.num_latents} latents x {self.cfg.perceiver_depth} layers")
-        print(f"  XAttn mode: {self.xattn_mode}")
-        if self.xattn_mode == "structured_square_mixer":
-            print(
-                f"  Structured router: mode={self.xattn_structured_router_mode}, "
-                f"text_gate_mode={self.xattn_text_gate_mode}, "
-                f"engineered_source={self.xattn_structured_use_engineered_source}"
-            )
-        if self.shared_readout is not None:
-            print(f"  Fusion tokens: {self.cfg.num_fusion_tokens} per xattn layer (policy_latent_cond={bool(getattr(self.cfg, 'readout_use_policy_latent_cross_attention', False))})")
+        if self.engineered_only_xattn_ablation:
+            print("  Adapter ablation: engineered_only_xattn_ablation=True")
+            print("  Backbone / CSMP / Perceiver: skipped")
         else:
-            print("  Fusion tokens: unused in structured_square_mixer mode")
-        print(
-            f"  XAttn recurrent-query: state_dim={int(getattr(self.cfg, 'xattn_recurrent_query_state_dim', 256))}, "
-            f"use_mlp={bool(getattr(self.cfg, 'xattn_recurrent_query_use_mlp', False))}, "
-            f"share_gru_across_layers={self.xattn_recurrent_query_share_gru_across_layers}"
-        )
+            print(f"  Perceiver: {self.cfg.num_latents} latents x {self.cfg.perceiver_depth} layers")
+        print(f"  XAttn mode: {self.xattn_mode}")
+        if self.xattn_mode == "structured_cross_attn":
+            print(
+                f"  Structured attention: mode={self.xattn_structured_router_mode}, "
+                f"text_gate_mode={self.xattn_text_gate_mode}, "
+                f"engineered_source={self.xattn_structured_use_engineered_source}, "
+                f"engineered_only_ablation={self.engineered_only_xattn_ablation}"
+            )
+        print("  XAttn query source: current decoder hidden states")
         if self.enable_lm_prepend_latents:
             print(
                 f"  LM prepend latents: {self.num_lm_prepend_latents} tokens "
@@ -3845,7 +3899,7 @@ class ChessFusionAdapter(nn.Module):
         print(f"  Aux weights: policy={self.cfg.aux_policy_weight}, eval={self.cfg.aux_eval_weight}")
 
     def _warn_ignored_structured_readout_settings(self) -> None:
-        if self.xattn_mode != 'structured_square_mixer':
+        if self.xattn_mode != 'structured_cross_attn':
             return
 
         ignored: List[str] = []
@@ -3862,9 +3916,41 @@ class ChessFusionAdapter(nn.Module):
 
         if ignored:
             print(
-                "  WARNING: chess_fusion.xattn_mode='structured_square_mixer' ignores "
+                "  WARNING: chess_fusion.xattn_mode='structured_cross_attn' ignores "
                 f"shared readout settings: {', '.join(ignored)}"
             )
+
+    @staticmethod
+    def _resize_feature_dim(features: torch.Tensor, target_dim: int) -> torch.Tensor:
+        batch_size = int(features.size(0))
+        resized = features.new_zeros(batch_size, int(target_dim))
+        copy_dim = min(int(features.size(-1)), int(target_dim))
+        if copy_dim > 0:
+            resized[:, :copy_dim] = features[:, :copy_dim]
+        return resized
+
+    def _build_engineered_only_ablation_state(
+        self,
+        engineered_features: torch.Tensor,
+        side_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pooled = engineered_features.mean(dim=1)
+        global_perceiver = self._resize_feature_dim(pooled, int(self.cfg.perceiver_dim))
+        context_token = self._resize_feature_dim(pooled, int(self.cfg.tap_projection_dim))
+        side_scalar = side_tensor.to(device=pooled.device, dtype=pooled.dtype).mul(2.0).sub(1.0)
+        if global_perceiver.size(-1) > 0:
+            global_perceiver[:, 0] = global_perceiver[:, 0] + side_scalar
+        if context_token.size(-1) > 0:
+            context_token[:, 0] = context_token[:, 0] + side_scalar
+
+        perceiver_latents = engineered_features.new_zeros(
+            engineered_features.size(0),
+            65,
+            int(self.cfg.perceiver_dim),
+        )
+        if perceiver_latents.size(-1) > 0:
+            perceiver_latents[:, 64, :] = global_perceiver
+        return perceiver_latents, context_token.unsqueeze(1)
 
     def _reinitialize_student_backbone(self):
         """Randomly reinitialize student backbone parameters."""
@@ -3888,6 +3974,8 @@ class ChessFusionAdapter(nn.Module):
             self._freeze_transformer_params()
 
     def _freeze_cnn_params(self):
+        if self.backbone is None:
+            return
         maia = self.backbone.maia
         for p in maia.chess_cnn.parameters():
             p.requires_grad = False
@@ -3896,6 +3984,8 @@ class ChessFusionAdapter(nn.Module):
         maia.pos_embedding.requires_grad = False
 
     def _unfreeze_cnn_params(self):
+        if self.backbone is None:
+            return
         maia = self.backbone.maia
         for p in maia.chess_cnn.parameters():
             p.requires_grad = True
@@ -3904,6 +3994,8 @@ class ChessFusionAdapter(nn.Module):
         maia.pos_embedding.requires_grad = True
 
     def _freeze_transformer_params(self):
+        if self.backbone is None:
+            return
         maia = self.backbone.maia
         for p in maia.transformer.parameters():
             p.requires_grad = False
@@ -3913,6 +4005,8 @@ class ChessFusionAdapter(nn.Module):
             p.requires_grad = False
 
     def _unfreeze_transformer_params(self):
+        if self.backbone is None:
+            return
         maia = self.backbone.maia
         for p in maia.transformer.parameters():
             p.requires_grad = True
@@ -3932,16 +4026,18 @@ class ChessFusionAdapter(nn.Module):
                 p.requires_grad = True
 
     def _freeze_perceiver_params(self):
-        for p in self.perceiver.parameters():
-            p.requires_grad = False
-        if hasattr(self.multi_scale, 'side_token'):
+        if self.perceiver is not None:
+            for p in self.perceiver.parameters():
+                p.requires_grad = False
+        if self.multi_scale is not None and hasattr(self.multi_scale, 'side_token'):
             for p in self.multi_scale.side_token.parameters():
                 p.requires_grad = False
 
     def _unfreeze_perceiver_params(self):
-        for p in self.perceiver.parameters():
-            p.requires_grad = True
-        if hasattr(self.multi_scale, 'side_token'):
+        if self.perceiver is not None:
+            for p in self.perceiver.parameters():
+                p.requires_grad = True
+        if self.multi_scale is not None and hasattr(self.multi_scale, 'side_token'):
             for p in self.multi_scale.side_token.parameters():
                 p.requires_grad = True
 
@@ -3949,16 +4045,10 @@ class ChessFusionAdapter(nn.Module):
         for xattn in self.gated_xattns:
             for p in xattn.parameters():
                 p.requires_grad = False
-        if self.shared_readout is not None:
-            for p in self.shared_readout.parameters():
-                p.requires_grad = False
 
     def _unfreeze_xattn_params(self):
         for xattn in self.gated_xattns:
             for p in xattn.parameters():
-                p.requires_grad = True
-        if self.shared_readout is not None:
-            for p in self.shared_readout.parameters():
                 p.requires_grad = True
 
     def _freeze_prepend_latent_params(self):
@@ -4033,17 +4123,13 @@ class ChessFusionAdapter(nn.Module):
 
         total_layers = len(layers)
 
-        # Wire shared readout into each GatedCrossAttention and set layer fraction
+        # Set layer fraction on each GatedCrossAttention
         xattn_by_layer: Dict[int, GatedCrossAttention] = {}
         for i, xattn in zip(self.xattn_layer_indices, self.gated_xattns):
             if i >= total_layers:
                 print(f"  WARNING: xattn layer index {i} >= num layers {total_layers}, skipping")
                 continue
             xattn.tau = i / total_layers
-            if self.xattn_mode == 'recurrent_query_attn':
-                xattn._shared_readout = self.shared_readout
-            else:
-                xattn._shared_readout = None
             xattn_by_layer[i] = xattn
 
         pseudotoken_by_layer: Dict[int, LayerPseudotokenAttention] = {}
@@ -4174,14 +4260,14 @@ class ChessFusionAdapter(nn.Module):
             ffn_gate = torch.tanh(xattn.ffn_gate).item()
             gate_values[f"gates/layer_{idx}_ffn"] = ffn_gate
 
-            if xattn.xattn_mode == "recurrent_query_attn":
-                gate_values[f"recurrent_query/layer_{idx}_gate_perceiver"] = torch.tanh(xattn.source_gate_perc).item()
-                gate_values[f"recurrent_query/layer_{idx}_gate_csmp"] = torch.tanh(xattn.source_gate_csmp).item()
-                gate_values[f"recurrent_query/layer_{idx}_gate_policy"] = torch.tanh(xattn.source_gate_policy).item()
-            if xattn._last_recurrent_query_state is not None:
-                rq = xattn._last_recurrent_query_state
-                gate_values[f"recurrent_query/layer_{idx}_state_norm"] = rq.norm(dim=-1).mean().item()
-                gate_values[f"recurrent_query/layer_{idx}_state_std"] = rq.std().item()
+            if xattn.xattn_mode == "cross_attn":
+                gate_values[f"xattn_source/layer_{idx}_gate_perceiver"] = torch.tanh(xattn.source_gate_perc).item()
+                gate_values[f"xattn_source/layer_{idx}_gate_csmp"] = torch.tanh(xattn.source_gate_csmp).item()
+                gate_values[f"xattn_source/layer_{idx}_gate_policy"] = torch.tanh(xattn.source_gate_policy).item()
+            if xattn._last_query_states is not None:
+                q_states = xattn._last_query_states
+                gate_values[f"xattn_query/layer_{idx}_state_norm"] = q_states.norm(dim=-1).mean().item()
+                gate_values[f"xattn_query/layer_{idx}_state_std"] = q_states.std().item()
 
         return gate_values
 
@@ -4193,7 +4279,7 @@ class ChessFusionAdapter(nn.Module):
         for i, idx in enumerate(self.xattn_layer_indices):
             xattn = self.gated_xattns[i]
             structured = getattr(xattn, "_last_structured_metrics", None)
-            if xattn.xattn_mode != "structured_square_mixer" or structured is None:
+            if xattn.xattn_mode != "structured_cross_attn" or structured is None:
                 continue
             source_names = tuple(getattr(xattn, "structured_square_source_names", ("csmp", "perceiver", "policy")))
 
@@ -4218,8 +4304,14 @@ class ChessFusionAdapter(nn.Module):
             metrics[f"structured_xattn/layer_{idx}/max_slot_square_index"] = structured["max_slot_square_index"].item()
             metrics[f"structured_xattn/layer_{idx}/square_entropy"] = structured["square_entropy"].item()
             metrics[f"structured_xattn/layer_{idx}/square_entropy_norm"] = structured["square_entropy_norm"].item()
+            metrics[f"structured_xattn/layer_{idx}/gate_weighted_square_entropy_norm"] = (
+                structured["gate_weighted_square_entropy_norm"].item()
+            )
             metrics[f"structured_xattn/layer_{idx}/square_usage_entropy"] = structured["square_usage_entropy"].item()
             metrics[f"structured_xattn/layer_{idx}/square_usage_entropy_norm"] = structured["square_usage_entropy_norm"].item()
+            metrics[f"structured_xattn/layer_{idx}/gate_weighted_square_usage_entropy_norm"] = (
+                structured["gate_weighted_square_usage_entropy_norm"].item()
+            )
             metrics[f"structured_xattn/layer_{idx}/max_square_mass"] = structured["max_square_mass"].item()
             metrics[f"structured_xattn/layer_{idx}/max_square_index"] = structured["max_square_index"].item()
             metrics[f"structured_xattn/layer_{idx}/global_entropy"] = structured["global_entropy"].item()
@@ -4291,7 +4383,7 @@ class ChessFusionAdapter(nn.Module):
         for i, idx in enumerate(self.xattn_layer_indices):
             xattn = self.gated_xattns[i]
             trace = getattr(xattn, "_last_token_trace", None)
-            if xattn.xattn_mode != "structured_square_mixer" or trace is None:
+            if xattn.xattn_mode != "structured_cross_attn" or trace is None:
                 continue
 
             batch_size = int(trace["raw_slot_weights"].size(0))
@@ -4316,12 +4408,6 @@ class ChessFusionAdapter(nn.Module):
             }
             for source_idx, source_name in enumerate(source_labels):
                 trace_dict[f"{source_name}_square_weights"] = source_square_weights[source_idx].clone()
-            if len(source_labels) >= 1:
-                trace_dict["csmp_square_weights"] = source_square_weights[0].clone()
-            if len(source_labels) >= 2:
-                trace_dict["perceiver_square_weights"] = source_square_weights[1].clone()
-            if len(source_labels) >= 3:
-                trace_dict["policy_square_weights"] = source_square_weights[2].clone()
             if "effective_head_gates" in trace:
                 trace_dict["effective_head_gates"] = (
                     trace["effective_head_gates"][sample_index].detach().float().cpu()
@@ -4345,12 +4431,6 @@ class ChessFusionAdapter(nn.Module):
                     trace_dict[f"{source_name}_square_contribution_norms"] = (
                         contribution_norms[source_idx].clone()
                     )
-                if len(source_labels) >= 1:
-                    trace_dict["csmp_square_contribution_norms"] = contribution_norms[0].clone()
-                if len(source_labels) >= 2:
-                    trace_dict["perceiver_square_contribution_norms"] = contribution_norms[1].clone()
-                if len(source_labels) >= 3:
-                    trace_dict["policy_square_contribution_norms"] = contribution_norms[2].clone()
             if "raw_slot_weights_per_head" in trace:
                 per_head_source_square_weights = (
                     trace["source_square_weights_per_head"][sample_index].detach().float().cpu()
@@ -4369,12 +4449,6 @@ class ChessFusionAdapter(nn.Module):
                     trace_dict[f"{source_name}_square_weights_per_head"] = (
                         per_head_source_square_weights[:, source_idx].clone()
                     )
-                if len(source_labels) >= 1:
-                    trace_dict["csmp_square_weights_per_head"] = per_head_source_square_weights[:, 0].clone()
-                if len(source_labels) >= 2:
-                    trace_dict["perceiver_square_weights_per_head"] = per_head_source_square_weights[:, 1].clone()
-                if len(source_labels) >= 3:
-                    trace_dict["policy_square_weights_per_head"] = per_head_source_square_weights[:, 2].clone()
             if "source_square_contribution_norms_per_head" in trace:
                 per_head_contribution_norms = (
                     trace["source_square_contribution_norms_per_head"][sample_index].detach().float().cpu()
@@ -4390,18 +4464,6 @@ class ChessFusionAdapter(nn.Module):
                     trace_dict[f"{source_name}_square_contribution_norms_per_head"] = (
                         per_head_contribution_norms[:, source_idx].clone()
                     )
-                if len(source_labels) >= 1:
-                    trace_dict["csmp_square_contribution_norms_per_head"] = (
-                        per_head_contribution_norms[:, 0].clone()
-                    )
-                if len(source_labels) >= 2:
-                    trace_dict["perceiver_square_contribution_norms_per_head"] = (
-                        per_head_contribution_norms[:, 1].clone()
-                    )
-                if len(source_labels) >= 3:
-                    trace_dict["policy_square_contribution_norms_per_head"] = (
-                        per_head_contribution_norms[:, 2].clone()
-                    )
             trace_dict["router_mode"] = trace["router_mode"]
             traces[idx] = trace_dict
 
@@ -4410,7 +4472,7 @@ class ChessFusionAdapter(nn.Module):
     def compute_structured_xattn_sparse_loss(self, device: torch.device) -> torch.Tensor:
         losses: List[torch.Tensor] = []
         for xattn in self.gated_xattns:
-            if xattn.xattn_mode != "structured_square_mixer":
+            if xattn.xattn_mode != "structured_cross_attn":
                 continue
             loss = getattr(xattn, "_last_structured_square_sparse_loss", None)
             if loss is not None:
@@ -4428,14 +4490,15 @@ class ChessFusionAdapter(nn.Module):
         target_entropy = float(getattr(self.cfg, "structured_xattn_square_diversity_target_entropy", 0.5))
         target_entropy = min(max(target_entropy, 0.0), 1.0)
         for xattn in self.gated_xattns:
-            if xattn.xattn_mode != "structured_square_mixer":
+            if xattn.xattn_mode != "structured_cross_attn":
                 continue
             usage_entropy = getattr(xattn, "_last_structured_square_usage_entropy_norm", None)
-            if usage_entropy is None:
+            gate_usage = getattr(xattn, "_last_structured_gate_usage_mean_abs", None)
+            if usage_entropy is None or gate_usage is None:
                 continue
             target = usage_entropy.new_tensor(target_entropy)
             entropies.append(usage_entropy)
-            losses.append(F.relu(target - usage_entropy))
+            losses.append(gate_usage * F.relu(target - usage_entropy))
         if losses:
             return torch.stack(losses).mean(), torch.stack(entropies).mean()
         zero = torch.tensor(0.0, device=device)
@@ -4450,7 +4513,7 @@ class ChessFusionAdapter(nn.Module):
         target_usage = float(getattr(self.cfg, "structured_xattn_gate_usage_target", 0.1))
         target_usage = min(max(target_usage, 0.0), 1.0)
         for xattn in self.gated_xattns:
-            if xattn.xattn_mode != "structured_square_mixer":
+            if xattn.xattn_mode != "structured_cross_attn":
                 continue
             usage = getattr(xattn, "_last_structured_gate_usage_mean_abs", None)
             if usage is None:
@@ -4466,8 +4529,7 @@ class ChessFusionAdapter(nn.Module):
     @torch.no_grad()
     def revive_recurrent_text_state_if_stuck(self, scale_value: float = 1.0) -> int:
         """
-        Backward-compatibility helper for checkpoints created with a dead init:
-        recurrent readout projection all-zeros AND recurrent scale exactly zero.
+        Backward-compatibility no-op kept for legacy checkpoints.
 
         Returns:
             1 if revived, else 0.
@@ -4501,8 +4563,18 @@ class ChessFusionAdapter(nn.Module):
                 move_eval_logits: (B, 1880) CE/pairwise branch logits
                 move_eval_mse_logits: (B, 1880) MSE branch logits
         """
-        batch_size = boards.size(0)
-        device = boards.device
+        engineered_features = kwargs.get('engineered_features', None)
+        if boards is None:
+            if engineered_features is None:
+                raise ValueError(
+                    "engineered_features must be provided when boards=None "
+                    "(required by engineered_only_xattn_ablation)"
+                )
+            batch_size = engineered_features.size(0)
+            device = engineered_features.device
+        else:
+            batch_size = boards.size(0)
+            device = boards.device
         _profile = getattr(self, '_profile', False)
 
         if _profile:
@@ -4521,6 +4593,51 @@ class ChessFusionAdapter(nn.Module):
                 [1 if s else 0 for s in side_to_move],
                 dtype=torch.long, device=device
             )
+
+        if self.engineered_only_xattn_ablation:
+            if engineered_features is None:
+                raise ValueError(
+                    "engineered_features required when "
+                    "engineered_only_xattn_ablation=True"
+                )
+            engineered_features = engineered_features.to(device)
+            latents, context = self._build_engineered_only_ablation_state(
+                engineered_features=engineered_features,
+                side_tensor=side_tensor,
+            )
+            policy_logits = engineered_features.new_zeros(batch_size, 1880)
+            eval_logits = engineered_features.new_zeros(batch_size, int(self.cfg.num_eval_buckets))
+            entropy_metrics: Dict[str, torch.Tensor] = {}
+            precomputed_policy = kwargs.get('precomputed_policy', None)
+            policy_targets = (
+                precomputed_policy.to(device)
+                if precomputed_policy is not None
+                else None
+            )
+            if _profile:
+                self._last_profile_ms = {
+                    "multi_scale": 0.0,
+                    "csmp": 0.0,
+                    "perceiver": 0.0,
+                    "policy_head": 0.0,
+                    "policy_targets": 0.0,
+                    "total": 0.0,
+                }
+            return {
+                'perceiver_latents': latents,
+                'context': context,
+                'csmp_square_tokens': None,
+                'prepend_embeddings': None,
+                'policy_logits': policy_logits,
+                'eval_logits': eval_logits,
+                'policy_latents': None,
+                'policy_targets': policy_targets,
+                'entropy_metrics': entropy_metrics,
+                'move_eval_logits': None,
+                'move_eval_mse_logits': None,
+                'move_mate_logits': None,
+                'engineered_square_features': engineered_features,
+            }
 
         # Compute absolute-space board tensor for CSMP, BSR, SPP
         # (un-mirrors spatial flip + piece color swap for Black-to-move samples)
@@ -4546,7 +4663,6 @@ class ChessFusionAdapter(nn.Module):
             _t1 = time.perf_counter()
 
         # Perceiver â€” returns shared latents (each xattn layer reads them independently)
-        engineered_features = kwargs.get('engineered_features', None)
         if self.xattn_structured_use_engineered_source and engineered_features is None:
             raise ValueError(
                 "engineered_features required when "

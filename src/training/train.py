@@ -58,7 +58,13 @@ from peft import (
     prepare_model_for_kbit_training
 )
 
-from training.chess_adapter import ChessPositionAdapter, EngineeredPositionAdapter, HybridPositionAdapter, extract_engineered_features
+from training.chess_adapter import (
+    ChessPositionAdapter,
+    ENGINEERED_FEATURE_DIM,
+    EngineeredPositionAdapter,
+    HybridPositionAdapter,
+    extract_engineered_features,
+)
 try:
     from training.perceiver_adapter import PerceiverChessAdapter, extract_perceiver_features
 except ImportError:
@@ -127,9 +133,6 @@ def _filter_chess_fusion_adapter_state_dict(state_dict: dict, model_config: Mode
         "aux_heads": getattr(fusion_cfg, "load_checkpoint_aux_heads", True),
     }
 
-    if all(load_flags.values()):
-        return state_dict, {}
-
     module_prefixes = {
         "backbone": ("backbone.",),
         "teacher_backbone": ("teacher_backbone.",),
@@ -152,19 +155,24 @@ def _filter_chess_fusion_adapter_state_dict(state_dict: dict, model_config: Mode
 
     filtered = {}
     dropped_counts = {k: 0 for k in module_prefixes}
-    structured_square_mixer_enabled = (
-        getattr(fusion_cfg, "xattn_mode", "recurrent_query_attn") == "structured_square_mixer"
-    )
+    raw_xattn_mode = getattr(fusion_cfg, "xattn_mode", "cross_attn")
 
     for key, value in state_dict.items():
         if key.startswith("gated_xattns."):
             parts = key.split(".")
             if len(parts) >= 3:
                 leaf_name = parts[2]
-                if leaf_name in {"q_norm", "q_proj", "k_proj", "v_proj"}:
-                    dropped_counts["xattn"] += 1
-                    continue
-                if structured_square_mixer_enabled and leaf_name == "recurrent_query_proj":
+                if leaf_name in {
+                    "q_norm",
+                    "k_proj",
+                    "v_proj",
+                    "recurrent_query_proj",
+                    "recurrent_query_gru",
+                    "recurrent_query_norm",
+                    "structured_router_stem",
+                    "structured_square_weight_proj",
+                    "structured_global_weight_proj",
+                }:
                     dropped_counts["xattn"] += 1
                     continue
 
@@ -583,7 +591,7 @@ class ChessCommentaryModel(nn.Module):
             self.adapter = EngineeredPositionAdapter(
                 llm_dim=llm_dim,
             )
-            print("Using EngineeredPositionAdapter (FEN-based, 204-dim features)")
+            print(f"Using EngineeredPositionAdapter (FEN-based, {ENGINEERED_FEATURE_DIM}-dim features)")
         elif config.mode == "perceiver":
             if PerceiverChessAdapter is None:
                 raise ImportError("Perceiver adapter requested but training.perceiver_adapter module not found.")
@@ -737,7 +745,7 @@ class ChessCommentaryModel(nn.Module):
             eval_targets: (B,) eval bucket class indices for Stockfish position eval
             side_to_move: Boolean tensor (B,) - True=White, False=Black
             fen: List of FEN strings (for LC0 adapter piece encoding)
-            engineered_features: Pre-computed features (B, 64, 204)
+            engineered_features: Pre-computed features (B, 64, ENGINEERED_FEATURE_DIM)
             perceiver_features: Tuple of (sq_features, glob_features)
             maia_features: Tensor (B, 18, 8, 8)
             maia_policy: Precomputed (B, 1880) teacher policy logits
@@ -794,19 +802,27 @@ class ChessCommentaryModel(nn.Module):
             else:
                 position_embeds = self.adapter(maia_features, side_to_move=side_to_move)
         elif self.config.mode == "chess_fusion":
-            if maia_features is None:
-                raise ValueError("maia_features must be provided when mode='chess_fusion'")
-            maia_features = maia_features.to(adapter_device)
+            engineered_only_ablation = bool(
+                getattr(self.config.chess_fusion, "engineered_only_xattn_ablation", False)
+            )
+            if engineered_only_ablation:
+                maia_features = None
+            else:
+                if maia_features is None:
+                    raise ValueError("maia_features must be provided when mode='chess_fusion'")
+                maia_features = maia_features.to(adapter_device)
             fusion_kwargs = {'side_to_move': side_to_move}
             needs_main_engineered_features = (
                 getattr(self.config.chess_fusion, "use_engineered_concat", False)
                 or getattr(self.config.chess_fusion, "xattn_structured_use_engineered_source", False)
+                or engineered_only_ablation
             )
             if needs_main_engineered_features:
                 if engineered_features is None:
                     raise ValueError(
                         "engineered_features required for chess_fusion when "
-                        "use_engineered_concat or xattn_structured_use_engineered_source is enabled"
+                        "use_engineered_concat, xattn_structured_use_engineered_source, "
+                        "or engineered_only_xattn_ablation is enabled"
                     )
                 fusion_kwargs['engineered_features'] = engineered_features.to(adapter_device)
             if maia_policy is not None:
@@ -1211,7 +1227,12 @@ class ChessCommentaryModel(nn.Module):
         elif self.config.mode == "chess_fusion":
             if fen is None:
                 raise ValueError("FEN is required for chess_fusion mode")
-            features = extract_maia_features(fen).unsqueeze(0).to(device)
+            engineered_only_ablation = bool(
+                getattr(self.config.chess_fusion, "engineered_only_xattn_ablation", False)
+            )
+            features = None
+            if not engineered_only_ablation:
+                features = extract_maia_features(fen).unsqueeze(0).to(device)
             side_tensor = torch.tensor([side_to_move], dtype=torch.bool, device=device)
             fusion_kwargs = {"side_to_move": side_tensor}
             if maia_policy is not None:
@@ -1219,6 +1240,7 @@ class ChessCommentaryModel(nn.Module):
             if (
                 getattr(self.config.chess_fusion, "use_engineered_concat", False)
                 or getattr(self.config.chess_fusion, "xattn_structured_use_engineered_source", False)
+                or engineered_only_ablation
             ):
                 engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
                 fusion_kwargs["engineered_features"] = engineered
@@ -2544,11 +2566,24 @@ class ChessCommentaryTrainingDataset(Dataset):
             if len(fen_parts) >= 2:
                 side_to_move = (fen_parts[1] == 'w')
         
-        # Pre-compute engineered features if enabled (moves CPU work out of forward pass)
-        # Used by both engineered-only mode and hybrid mode
+        # Pre-compute engineered features if enabled (moves CPU work out of forward pass).
+        # Some consumers need the configured feature mode, while chess-fusion's
+        # structured engineered source specifically needs the full "main" features.
         engineered_features = None
-        if (self.use_engineered_features or self.use_hybrid_features) and fen:
-            engineered_features = extract_engineered_features(fen, mode=self.feature_mode)  # (64, 204)
+        main_engineered_features = None
+        if fen:
+            if self.use_engineered_features or self.use_hybrid_features:
+                engineered_features = extract_engineered_features(fen, mode=self.feature_mode)  # (64, ENGINEERED_FEATURE_DIM)
+                if self.feature_mode == "main":
+                    main_engineered_features = engineered_features
+
+            needs_main_engineered_features = (
+                self.use_perceiver_main_engineered_concat
+                or self.use_maia_main_engineered_concat
+                or self.use_chess_fusion_main_engineered_source
+            )
+            if needs_main_engineered_features and main_engineered_features is None:
+                main_engineered_features = extract_engineered_features(fen, mode="main")
             
         # Online extraction for Perceiver
         perceiver_sq_feats = None
@@ -2558,8 +2593,7 @@ class ChessCommentaryTrainingDataset(Dataset):
                 raise ImportError("Perceiver features requested but training.perceiver_adapter module not found.")
             sq, glob = extract_perceiver_features(fen)
             if self.use_perceiver_main_engineered_concat:
-                engineered_features = extract_engineered_features(fen, mode="main")
-                sq = torch.cat([sq, engineered_features], dim=-1)
+                sq = torch.cat([sq, main_engineered_features], dim=-1)
             perceiver_sq_feats = sq
             perceiver_glob_feats = glob
             
@@ -2567,10 +2601,9 @@ class ChessCommentaryTrainingDataset(Dataset):
         maia_features = None
         if self.use_maia_features and fen:
             maia_features = extract_maia_features(fen)
-            if self.use_maia_main_engineered_concat and engineered_features is None:
-                engineered_features = extract_engineered_features(fen, mode="main")
-            if self.use_chess_fusion_main_engineered_source and engineered_features is None:
-                engineered_features = extract_engineered_features(fen, mode="main")
+
+        if main_engineered_features is not None:
+            engineered_features = main_engineered_features
         
         # Build prompt text (may vary per-sample when PGN/last_move is included)
         last_move = sample.get("last_move", None)
@@ -3366,7 +3399,13 @@ def train(config: TrainingConfig):
             use_engineered_features=(config.model.mode == "engineered"),
             use_hybrid_features=(config.model.mode == "hybrid"),
             use_perceiver_features=(config.model.mode == "perceiver"),
-            use_maia_features=(config.model.mode in ("maia", "chess_fusion")),
+            use_maia_features=(
+                config.model.mode == "maia"
+                or (
+                    config.model.mode == "chess_fusion"
+                    and not getattr(config.model.chess_fusion, "engineered_only_xattn_ablation", False)
+                )
+            ),
             feature_mode=getattr(config.model, 'engineered_features_type', 'sparse'),
             use_perceiver_main_engineered_concat=getattr(config.model.perceiver, "use_main_engineered_concat", False),
             use_maia_main_engineered_concat=(
@@ -3375,7 +3414,10 @@ def train(config: TrainingConfig):
             ),
             use_chess_fusion_main_engineered_source=(
                 config.model.mode == "chess_fusion"
-                and getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
+                and (
+                    getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
+                    or getattr(config.model.chess_fusion, "engineered_only_xattn_ablation", False)
+                )
             ),
             preload=config.preload_dataset,
             use_last_move_in_prompt=config.use_last_move_in_prompt,
@@ -3413,7 +3455,13 @@ def train(config: TrainingConfig):
                 use_engineered_features=(config.model.mode == "engineered"),
                 use_hybrid_features=(config.model.mode == "hybrid"),
                 use_perceiver_features=(config.model.mode == "perceiver"),
-                use_maia_features=(config.model.mode in ("maia", "chess_fusion")),
+                use_maia_features=(
+                    config.model.mode == "maia"
+                    or (
+                        config.model.mode == "chess_fusion"
+                        and not getattr(config.model.chess_fusion, "engineered_only_xattn_ablation", False)
+                    )
+                ),
                 feature_mode=getattr(config.model, 'engineered_features_type', 'sparse'),
                 use_perceiver_main_engineered_concat=getattr(config.model.perceiver, "use_main_engineered_concat", False),
                 use_maia_main_engineered_concat=(
@@ -3422,7 +3470,10 @@ def train(config: TrainingConfig):
                 ),
                 use_chess_fusion_main_engineered_source=(
                     config.model.mode == "chess_fusion"
-                    and getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
+                    and (
+                        getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
+                        or getattr(config.model.chess_fusion, "engineered_only_xattn_ablation", False)
+                    )
                 ),
                 preload=config.preload_dataset,
                 use_last_move_in_prompt=config.use_last_move_in_prompt,

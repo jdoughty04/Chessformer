@@ -68,37 +68,60 @@ These losses let the adapter learn chess structure even when the LLM is frozen o
 
 Selected decoder layers are wrapped with `FusionDecoderLayer`, which injects chess context via gated cross-attention.
 
-The active fusion mode is **structured square mixer**. A shared router-conditioning MLP consumes the recurrent text state together with the Perceiver global latent, then emits:
+The active structured fusion mode is `structured_cross_attn` (legacy alias:
+`structured_square_mixer`). Each selected decoder layer forms text queries from
+`LayerNorm(hidden_states) -> q_proj`, then runs two per-head attention branches:
 
-- square-router logits over `64 x 3` aligned slots (CSMP, Perceiver, Policy per square)
-- global-router logits over the Perceiver global latent vs the side-to-move token
-- optional token-conditioned per-head gate logits
+- square attention over $64 \times 3$ aligned slots (CSMP, Perceiver, Policy per square)
+- global attention over the Perceiver global latent vs the side-to-move token
+- optional token-conditioned per-head gate logits from the same normalized token states
 
-Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-aligned source built from the `main` engineered features extracted in `src/training/chess_adapter.py`. Those `204` channels are:
+Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-aligned source built from the `main` engineered features extracted in `src/training/chess_adapter.py`. Those `205` channels are:
 
 - `64` dims: one-hot square identity
-- `12` dims: piece occupancy by piece type and color
+- `13` dims: piece occupancy by piece type/color plus an explicit empty-square channel
 - `64` dims: attacked-target bitmask for the piece on that square
 - `64` dims: defended-friendly-target bitmask for the piece on that square
 
-In that mode the structured router becomes `64 x 4`, and the inspector exposes an additional `Engineered` board.
+In that mode the structured square table becomes $64 \times 4$, and the inspector exposes an additional `Engineered` board.
+
+There is also a stronger ablation mode: `engineered_only_xattn_ablation: true`.
+In that configuration, the adapter backbone, CSMP stack, Perceiver, prepended
+latents, pseudotokens, and auxiliary adapter heads are all skipped. Structured
+x-attn is trained against a single square-aligned source:
+
+- `Engineered`
+
+The fusion layer still receives a global conditioning vector and a side/context
+token, but in this ablation they are deterministic summaries derived directly
+from the engineered features plus side-to-move rather than learned adapter
+latents. That keeps the experiment focused on whether x-attn alone can learn to
+route grounded square-local engineered features into the LLM.
 
 This is different from the older `use_engineered_concat` flag, which only
-concatenates those same `204` channels into the Perceiver input once at the
-front of the model. The new router source keeps the engineered features
+concatenates those same `205` channels into the Perceiver input once at the
+front of the model. The new structured source keeps the engineered features
 available directly at fusion time.
 
-By default (`xattn_structured_router_mode: shared`), one `192`-way square router is shared across all x-attn heads for a token. That is the backward-compatible path and keeps the aggregate inspector view easy to read. With `xattn_structured_router_mode: per_head`, each x-attn head gets its own square/global router so different heads can specialize on different squares or source types.
+Runtime structured fusion is always per-head attention. The config field
+`xattn_structured_router_mode` is kept only for backward compatibility; if an
+older config requests `shared`, it is accepted with a warning and coerced to
+`per_head`. The inspector still exposes aggregate views by averaging or
+gate-weighting the per-head attention maps.
 
 The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
 
-`tanh(static_head_gate + token_gate_logit)`
+$$
+\tanh(\mathrm{static\_head\_gate} + \mathrm{token\_gate\_logit})
+$$
 
-That dynamic gate is intentionally produced from the same router stem as the square/global routing decisions, so "which chess features matter?" and "how much chess should I inject?" are conditioned on the same token state.
+That dynamic gate is produced from the same normalized token state that also
+forms the attention query, so "which chess features matter?" and "how much
+chess should I inject?" stay coupled to the same decoder context.
 
 The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps one square-aligned representation central to both chess supervision and text generation.
 
-The engineered source is intentionally simpler than the learned CSMP / Perceiver / Policy sources. That makes it useful as a grounding anchor and ablation, but it is still limited: the current features are mostly static occupancy and attack/defense structure. If grounded routing remains weak, the next feature improvements worth testing are attacker/defender counts by side or piece type, pin/check indicators, legal-move participation, ray-blocker structure, pawn-structure flags, and possibly a small separate global engineered token rather than forcing every global fact through square-local channels.
+The engineered source is intentionally simpler than the learned CSMP / Perceiver / Policy sources. That makes it useful as a grounding anchor and ablation, but it is still limited: the current features are mostly static occupancy and attack/defense structure. If grounded attention remains weak, the next feature improvements worth testing are attacker/defender counts by side or piece type, pin/check indicators, legal-move participation, ray-blocker structure, pawn-structure flags, and possibly a small separate global engineered token rather than forcing every global fact through square-local channels.
 
 Additional injection mechanisms:
 

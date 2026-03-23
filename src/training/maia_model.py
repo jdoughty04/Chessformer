@@ -24,6 +24,8 @@ try:
 except ImportError:
     maia_utils = None
 
+from training.chess_adapter import ENGINEERED_FEATURE_DIM
+
 # =============================================================================
 # Move Vocabulary and Mapping
 # =============================================================================
@@ -626,7 +628,7 @@ class MaiaLLMAdapter(nn.Module):
         # perceiver_internal_dim overrides the default; None = legacy behavior
         explicit_dim = getattr(cfg, 'perceiver_internal_dim', None) if cfg else None
         if self.mode == "perceiver" and self.use_main_engineered_concat:
-            self.engineered_dim = 204
+            self.engineered_dim = ENGINEERED_FEATURE_DIM
             self.perceiver_dim = explicit_dim if explicit_dim is not None else self.llm_dim
             self.latent_base_dim = self.perceiver_dim - self.engineered_dim
         elif self.mode == "perceiver":
@@ -668,7 +670,7 @@ class MaiaLLMAdapter(nn.Module):
                 print(f"    Latent base dim={self.latent_base_dim}, + engineered {self.engineered_dim} -> {self.perceiver_dim}")
 
             # Latent queries: (1, k, latent_base_dim) - learned
-            # In concat mode, engineered features (204) are cat'd at runtime -> perceiver_dim
+            # In concat mode, engineered features are cat'd at runtime -> perceiver_dim
             self.latents = nn.Parameter(torch.randn(1, self.num_latents, self.latent_base_dim))
             
             # Check for MLP Projections
@@ -942,7 +944,7 @@ class MaiaLLMAdapter(nn.Module):
                 if engineered_features is None:
                     raise ValueError("engineered_features must be provided when Maia perceiver uses main engineered concat")
                 engineered_features = engineered_features.to(device)
-                # (B, 64, 1844) cat (B, 64, 204) -> (B, 64, 2048)
+                # (B, 64, 1843) cat (B, 64, 205) -> (B, 64, 2048)
                 x = torch.cat([x, engineered_features], dim=-1)
             
             # Add side embedding to latents (broadcast across k)

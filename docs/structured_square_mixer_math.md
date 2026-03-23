@@ -1,556 +1,390 @@
-# Structured Square Mixer Math
+# Structured Cross-Attn Math
 
-This document gives the exact forward equations and routing regularizers for
-`xattn_mode: structured_square_mixer` in the chess-fusion adapter.
+This document describes the exact forward equations and structured
+square-attention regularizers for the chess-fusion adapter's canonical
+structured decoder fusion mode:
+
+- `xattn_mode: structured_cross_attn`
+
+The legacy alias `xattn_mode: structured_square_mixer` loads the same
+implementation.
 
 It covers:
 
-- the decoder-side routing equations
-- the $64 \times N_{\text{src}}$ aligned slot construction
-- the square-marginal sparsity loss
-- the square-diversity loss
-- the precise config / live-control scalars that weight these terms
+- hidden-state query formation
+- the $64 \times N_{\mathrm{src}}$ aligned square-slot construction
+- per-head square and global cross-attention
+- token-conditioned gating
+- square sparsity, diversity, and gate-usage regularizers
 
 ## 1. Notation
 
 For one decoder fusion layer, let:
 
-- $B$ = batch size
-- $T$ = number of text tokens in the current decoder layer input
-- $d_l$ = LLM hidden size
-- $d_r$ = recurrent-query state size
-- $d_p$ = Perceiver latent size
-- $i \in \{0, \dots, 63\}$ = board-square index
-- $s \in \mathcal{S}$ = square-aligned source index
-- $k \in \{\text{perc\_global}, \text{side}\}$ = global-branch source index
+- $B$: batch size
+- $T$: number of text tokens at that decoder layer
+- $d_\ell$: LLM hidden size
+- $H$: number of x-attn heads
+- $d_h = d_\ell / H$: per-head dimension
+- $i \in \{0, \ldots, 63\}$: board-square index
+- $s \in S$: square-aligned source index
+- $k \in \{\mathrm{perc\_global}, \mathrm{side}\}$: global-branch source index
 
 By default:
 
-- $\mathcal{S} = \{\text{csmp}, \text{perc}, \text{pol}\}$
-- $N_{\text{src}} = 3$
+- $S = \{\mathrm{csmp}, \mathrm{perc}, \mathrm{pol}\}$
+- $N_{\mathrm{src}} = 3$
 
 If `xattn_structured_use_engineered_source: true`, then:
 
-- $\mathcal{S} = \{\text{csmp}, \text{perc}, \text{pol}, \text{eng}\}$
-- $N_{\text{src}} = 4$
+- $S = \{\mathrm{csmp}, \mathrm{perc}, \mathrm{pol}, \mathrm{eng}\}$
+- $N_{\mathrm{src}} = 4$
+
+If `engineered_only_xattn_ablation: true`, then:
+
+- $S = \{\mathrm{eng}\}$
+- $N_{\mathrm{src}} = 1$
+- the learned backbone / CSMP / Perceiver sources are skipped
+- the global latent and side token become deterministic summaries derived from
+  engineered features plus side-to-move
 
 The layer receives:
 
-- $h_{b,t} \in \mathbb{R}^{d_l}$: decoder hidden state for batch item $b$, token $t$
-- $x_i^{\text{csmp}} \in \mathbb{R}^{d_{\text{ctx}}}$: CSMP square token for square $i$
-- $x_i^{\text{perc}} \in \mathbb{R}^{d_p}$: Perceiver square latent for square $i$
-- $x_i^{\text{pol}} \in \mathbb{R}^{d_p}$: structured policy latent for square $i$
-- $x_i^{\text{eng}} \in \mathbb{R}^{204}$: optional engineered square feature vector
-- $g_b^{\text{perc}} \in \mathbb{R}^{d_p}$: Perceiver global latent
-- $g_b^{\text{side}} \in \mathbb{R}^{d_{\text{ctx}}}$: side-to-move token from pre-Perceiver context
+- $h_{b,t} \in \mathbb{R}^{d_\ell}$: decoder hidden state for token $t$
+- $x_{b,i}^{\mathrm{csmp}}$: CSMP square token for square $i$
+- $x_{b,i}^{\mathrm{perc}}$: Perceiver square latent for square $i$
+- $x_{b,i}^{\mathrm{pol}}$: structured policy latent for square $i$
+- $x_{b,i}^{\mathrm{eng}}$: optional engineered square feature vector
+- $g_b^{\mathrm{perc}}$: Perceiver global latent
+- $g_b^{\mathrm{side}}$: side-to-move / context token
+- $m_{b,t} \in \{0,1\}$: valid-text-token mask
 
-The current `main` engineered vector is:
-
-- `64` one-hot square-identity channels
-- `12` piece-type/color occupancy channels
-- `64` attacked-target bitmask channels for the piece on that square
-- `64` defended-friendly-target bitmask channels for the piece on that square
-
-The valid-text-token mask is:
-
-- $m_{b,t} \in \{0,1\}$
-
-All token averages below are taken only over valid positions:
+All token averages below are taken only over valid text positions:
 
 - $|V| = \sum_{b,t} m_{b,t}$
 
-## 2. Text-Side Query State
+## 2. Hidden-State Queries
 
-The decoder token is first converted into a recurrent query state:
+There is no recurrent text path. Each token query comes directly from the
+current decoder hidden state:
 
 $$
-r_{b,1:T} = \text{GRU}(\text{LN}(h_{b,1:T}))
+\tilde{q}_{b,t} = \operatorname{LN}(h_{b,t})
 $$
 
-where:
+The fused multi-head query tensor is:
 
-- $r_{b,t} \in \mathbb{R}^{d_r}$
-- invalid positions are zeroed after the GRU:
-  $r_{b,t} \leftarrow 0$ when $m_{b,t} = 0$
-
-## 3. Slot-Weight Logits
-
-Each text token scores the $64 \times N_{\text{src}}$ aligned square slots using the
-concatenation of:
-
-- its text-side recurrent state $r_{b,t}$
-- the Perceiver global latent $g_b^{\text{perc}}$
-
-Define:
-
 $$
-q_{b,t} = [r_{b,t} ; g_b^{\text{perc}}] \in \mathbb{R}^{d_r + d_p}
+Q_{b,t,h} = \operatorname{reshape}_H(W_q \tilde{q}_{b,t}) \in \mathbb{R}^{d_h}
 $$
 
-Then the slot logits are:
+Invalid text positions are masked out after query formation, so they contribute
+zero attention output and zero gate usage.
 
-$$
-z_{b,t} = W_{\text{sq}} q_{b,t} + b_{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}
-$$
+## 3. Structured Square Values
 
-The normalized slot weights are:
+Each active square source is projected independently into LLM space:
 
-$$
-\alpha_{b,t} = \text{softmax}(z_{b,t})
-$$
+- $v_{b,i}^{\mathrm{csmp}} = \operatorname{MLP}_{\mathrm{csmp}}(x_{b,i}^{\mathrm{csmp}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{perc}} = \operatorname{MLP}_{\mathrm{perc}}(x_{b,i}^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{pol}} = \operatorname{MLP}_{\mathrm{pol}}(x_{b,i}^{\mathrm{pol}}) \in \mathbb{R}^{d_\ell}$
+- $v_{b,i}^{\mathrm{eng}} = \operatorname{Linear}_{\mathrm{eng}}(\operatorname{LN}(x_{b,i}^{\mathrm{eng}})) \in \mathbb{R}^{d_\ell}$ when enabled
 
-We index them as:
+These are concatenated into one aligned square table:
 
 $$
-\alpha_{b,t,s,i}
+V_b^{\mathrm{sq}} =
+\left[
+v_{b,0}^{s_1}, \ldots, v_{b,63}^{s_1},
+v_{b,0}^{s_2}, \ldots,
+v_{b,63}^{s_{N_{\mathrm{src}}}}
+\right]
 $$
+
+so $V_b^{\mathrm{sq}} \in \mathbb{R}^{(64 N_{\mathrm{src}}) \times d_\ell}$.
 
-with the constraint:
+The same projected values are also mapped to attention keys:
 
 $$
-\sum_s \sum_i \alpha_{b,t,s,i} = 1
+K_b^{\mathrm{sq}} = \operatorname{reshape}_H(W_k^{\mathrm{sq}} V_b^{\mathrm{sq}})
+\in \mathbb{R}^{(64 N_{\mathrm{src}}) \times H \times d_h}
 $$
-
-for every valid token $(b,t)$.
-
-## 4. Shared Router Conditioning And Value Construction
 
-For each token, the structured mixer first builds one shared conditioning vector
-from the recurrent text state and the Perceiver global latent:
+$V_b^{\mathrm{sq}}$ itself is reshaped per head as:
 
 $$
-c_{b,t} = \text{MLP}_{\text{router}}([r_{b,t}; g_b^{\text{perc}}]) \in \mathbb{R}^{d_l}
+V_{b,j,h}^{\mathrm{sq}} \in \mathbb{R}^{d_h},
+\qquad
+j \in \{0, \ldots, 64 N_{\mathrm{src}} - 1\}
 $$
 
-The square router, global router, and optional token-gate head all read from
-this same conditioning vector. That means the token decides both where to read
-chess information from and how strongly to inject it using the same context.
+## 4. Global Values
 
-## 5. Value Construction For The $64 \times N_{\text{src}}$ Aligned Slots
+The structured path keeps a separate 2-token global branch:
 
-Each square source is projected into LLM space with a source-specific MLP:
+- $u_b^{\mathrm{perc\_global}} = \operatorname{MLP}_{\mathrm{perc\_global}}(g_b^{\mathrm{perc}}) \in \mathbb{R}^{d_\ell}$
+- $u_b^{\mathrm{side}} = \operatorname{MLP}_{\mathrm{side}}(g_b^{\mathrm{side}}) \in \mathbb{R}^{d_\ell}$
 
-- $v_{b,i}^{\text{csmp}} = \text{MLP}_{\text{csmp}}(x_{b,i}^{\text{csmp}}) \in \mathbb{R}^{d_l}$
-- $v_{b,i}^{\text{perc}} = \text{MLP}_{\text{perc}}(x_{b,i}^{\text{perc}}) \in \mathbb{R}^{d_l}$
-- $v_{b,i}^{\text{pol}}  = \text{MLP}_{\text{pol}}(x_{b,i}^{\text{pol}}) \in \mathbb{R}^{d_l}$
-- if enabled, $v_{b,i}^{\text{eng}} = \text{LN+Linear}_{\text{eng}}(x_{b,i}^{\text{eng}}) \in \mathbb{R}^{d_l}$
+Stack them as:
 
-These are concatenated into one aligned slot table. In the default 3-source case:
-
 $$
-V_b = [v_{b,0}^{\text{csmp}}, \dots, v_{b,63}^{\text{csmp}},
-       v_{b,0}^{\text{perc}}, \dots, v_{b,63}^{\text{perc}},
-       v_{b,0}^{\text{pol}},  \dots, v_{b,63}^{\text{pol}}] \in \mathbb{R}^{192 \times d_l}
+V_b^{\mathrm{glb}} = \left[u_b^{\mathrm{perc\_global}}, u_b^{\mathrm{side}}\right]
+\in \mathbb{R}^{2 \times d_\ell}
 $$
 
-If the engineered source is enabled, the table simply appends the engineered block:
+and project keys:
 
 $$
-V_b^{\text{eng}} = [V_b,
-       v_{b,0}^{\text{eng}}, \dots, v_{b,63}^{\text{eng}}] \in \mathbb{R}^{256 \times d_l}
+K_b^{\mathrm{glb}} = \operatorname{reshape}_H(W_k^{\mathrm{glb}} V_b^{\mathrm{glb}})
+\in \mathbb{R}^{2 \times H \times d_h}
 $$
 
-This engineered source is deliberately simple and square-local. If stronger
-groundedness is needed, the most natural extensions are attacker/defender
-counts by side or piece type, legal-move participation, pin/check indicators,
-ray-blocker structure, pawn-structure features, and a small separate global
-engineered token for facts that are awkward to express square-by-square.
+## 5. Square Attention Branch
 
-In `xattn_structured_router_mode: shared`, the square-router logits are:
+Each head attends over the full $64 \times N_{\mathrm{src}}$ aligned square table:
 
 $$
-z_{b,t}^{\text{sq}} = W_{\text{sq}} c_{b,t} + b_{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}
+a_{b,t,h,j}^{\mathrm{sq}} =
+\frac{\langle Q_{b,t,h}, K_{b,j,h}^{\mathrm{sq}} \rangle}{\sqrt{d_h}}
 $$
 
 $$
-\alpha_{b,t} = \text{softmax}(z_{b,t}^{\text{sq}})
+\alpha_{b,t,h,j}^{\mathrm{sq}} = \operatorname{softmax}_j(a_{b,t,h,j}^{\mathrm{sq}})
 $$
+
+where the softmax runs over all square/source slots $j$.
 
-The square-mixer output for token $(b,t)$ is:
+The per-head square mixture is:
 
 $$
-m_{b,t}^{\text{sq}} = \sum_s \sum_i \alpha_{b,t,s,i} v_{b,i}^s \in \mathbb{R}^{d_l}
+M_{b,t,h}^{\mathrm{sq}} =
+\sum_j \alpha_{b,t,h,j}^{\mathrm{sq}} V_{b,j,h}^{\mathrm{sq}}
 $$
 
-In `xattn_structured_router_mode: per_head`, each head gets its own square
-router:
+If we unpack slot $j$ into $(s, i)$, then:
 
 $$
-z_{b,t,h}^{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}, \qquad
-\alpha_{b,t,h} = \text{softmax}(z_{b,t,h}^{\text{sq}})
+\alpha_{b,t,h,s,i}^{\mathrm{sq}},
+\qquad
+\sum_s \sum_i \alpha_{b,t,h,s,i}^{\mathrm{sq}} = 1
 $$
-
-and the square mix is formed independently per head before the heads are
-concatenated back together.
-
-## 6. Global Branch
-
-The structured mixer also keeps a separate 2-way global branch. Its values are:
 
-- $u_b^{\text{perc\_global}} = \text{MLP}_{\text{perc\_global}}(g_b^{\text{perc}}) \in \mathbb{R}^{d_l}$
-- $u_b^{\text{side}} = \text{MLP}_{\text{side}}(g_b^{\text{side}}) \in \mathbb{R}^{d_l}$
+## 6. Global Attention Branch
 
-Its logits come from the same shared router-conditioning vector:
+Each head also attends over the two global tokens:
 
 $$
-z_{b,t}^{\text{glb}} = W_{\text{glb}} c_{b,t} + b_{\text{glb}} \in \mathbb{R}^2
+a_{b,t,h,k}^{\mathrm{glb}} =
+\frac{\langle Q_{b,t,h}, K_{b,k,h}^{\mathrm{glb}} \rangle}{\sqrt{d_h}}
 $$
 
 $$
-\beta_{b,t} = \text{softmax}(z_{b,t}^{\text{glb}})
+\beta_{b,t,h,k}^{\mathrm{glb}} = \operatorname{softmax}_k(a_{b,t,h,k}^{\mathrm{glb}})
 $$
 
-with components:
-
-- $\beta_{b,t,\text{perc\_global}}$
-- $\beta_{b,t,\text{side}}$
-
-The global-branch mix is:
-
 $$
-m_{b,t}^{\text{glb}} = \beta_{b,t,\text{perc\_global}} u_b^{\text{perc\_global}}
-              + \beta_{b,t,\text{side}} u_b^{\text{side}}
+M_{b,t,h}^{\mathrm{glb}} =
+\sum_k \beta_{b,t,h,k}^{\mathrm{glb}} V_{b,k,h}^{\mathrm{glb}}
 $$
 
-In `per_head` mode, the global router is also per head:
+The square and global branches are kept separate up to the gated sum. The
+regularizers described below apply only to the square branch, never to the
+2-token global branch.
 
-$$
-z_{b,t,h}^{\text{glb}} \in \mathbb{R}^2, \qquad
-\beta_{b,t,h} = \text{softmax}(z_{b,t,h}^{\text{glb}})
-$$
+## 7. Token-Conditioned Gates And Residual Injection
 
-## 7. Decoder Update
+Each head has a learned static gate logit $g_h^{\mathrm{static}}$.
 
-The two branches are added:
+If `xattn_text_gate_mode: tanh_head`, the layer also predicts token-conditioned
+gate logits directly from the normalized decoder hidden states:
 
 $$
-m_{b,t} = m_{b,t}^{\text{sq}} + m_{b,t}^{\text{glb}}
+\ell_{b,t,h} = \operatorname{MLP}_{\mathrm{gate}}(\tilde{q}_{b,t})
 $$
-
-If `xattn_text_gate_mode: tanh_head`, the same conditioning vector also emits a
-token-conditioned head gate:
 
-$$
-g_{b,t,h}^{\text{text}} = W_{\text{gate}} c_{b,t} + b_{\text{gate}}
-$$
+The effective structured gate is:
 
-combined with the learned static head gate:
+- without token gates:
 
 $$
-g_{b,t,h}^{\text{eff}} = \tanh(g_h^{\text{static}} + g_{b,t,h}^{\text{text}})
+g_{b,t,h}^{\mathrm{eff}} = m_{b,t} \cdot \tanh(g_h^{\mathrm{static}})
 $$
-
-If `xattn_text_gate_mode: none`, then $g_{b,t,h}^{\text{text}} = 0$ and the
-effective gate reduces to the old static tanh gate.
 
-The mixed vector is then gated, projected, and added as a residual update:
+- with token gates:
 
 $$
-o_{b,t} = O( g_{b,t}^{\text{eff}} \cdot \text{reshape\_heads}(m_{b,t}) )
+g_{b,t,h}^{\mathrm{eff}} = m_{b,t} \cdot \tanh(g_h^{\mathrm{static}} + \ell_{b,t,h})
 $$
 
-$$
-h'_{b,t} = h_{b,t} + o_{b,t}
-$$
+The combined per-head structured output is:
 
-Then the layer applies its FFN residual:
-
 $$
-h''_{b,t} = h'_{b,t} + \tanh(\text{ffn\_gate}) \cdot \text{FFN}(\text{LN}(h'_{b,t}))
+O_{b,t,h} =
+g_{b,t,h}^{\mathrm{eff}} \cdot \left(M_{b,t,h}^{\mathrm{sq}} + M_{b,t,h}^{\mathrm{glb}}\right)
 $$
-
-## 8. Why The Routing Regularizer Is Square-Marginal
 
-The router distribution $\alpha_{b,t,s,i}$ is over $64 N_{\text{src}}$ slots, but the desired
-inductive bias is:
+Heads are concatenated, projected back to model width, and added residually:
 
-- sparse over board squares
-- not necessarily diverse over the three source types
-
-So the regularizer first marginalizes out source identity:
-
 $$
-p_{b,t,i}^{\text{sq}} = \sum_s \alpha_{b,t,s,i}
+O_{b,t} = W_o \operatorname{concat}_h(O_{b,t,h})
 $$
 
-Now:
-
 $$
-\sum_i p_{b,t,i}^{\text{sq}} = 1
+h'_{b,t} = h_{b,t} + O_{b,t}
 $$
 
-and $p_{b,t}^{\text{sq}}$ is a pure 64-square distribution.
+The fusion layer then applies its gated FFN residual in the usual adapter path.
 
-This is the key design choice: routing can still prefer one source over another
-for a given square, but the auxiliary losses only care about which squares are
-being used.
+## 8. Square Marginals
 
-## 9. Square-Marginal Sparsity Loss
+The raw square/source attention is over $64 N_{\mathrm{src}}$ slots, but the square
+regularizers operate on the source-marginalized 64-square distribution:
 
-For each valid token, compute the 64-square entropy:
-
 $$
-H_{b,t}^{\text{sq}} = - \sum_i p_{b,t,i}^{\text{sq}} \log p_{b,t,i}^{\text{sq}}
+p_{b,t,h,i} = \sum_s \alpha_{b,t,h,s,i}^{\mathrm{sq}}
 $$
 
-Average over valid text tokens:
+This is the key design choice: attention may prefer one source over another for
+the same square, while sparsity/diversity act only on "which squares matter?"
 
-$$
-H_{\text{sq}} = \frac{1}{|V|} \sum_{b,t} m_{b,t} H_{b,t}^{\text{sq}}
-$$
+## 9. Sparse Square-Attention Metric
 
-Normalize by the maximum entropy $\log 64$:
+For each valid token/head pair, define the normalized square entropy:
 
 $$
-L_{\text{sparse}} = \frac{H_{\text{sq}}}{\log 64}
+H_{\mathrm{norm}}(p_{b,t,h}) =
+-\frac{\sum_i p_{b,t,h,i} \log p_{b,t,h,i}}{\log 64}
 $$
-
-Properties:
-
-- $L_{\text{sparse}}$ is near $0$ when each token puts its mass on very few squares
-- $L_{\text{sparse}}$ is near $1$ when each token spreads mass nearly uniformly over all
-  64 squares
-
-Config/live-control scalar:
 
-- `structured_xattn_sparse_weight`
+The cached sparse metric for one layer is:
 
-Contribution to total auxiliary loss:
-
 $$
-\lambda_{\text{sparse}} L_{\text{sparse}}
+L_{\mathrm{sparse}}^{\mathrm{layer}} =
+\frac{1}{|V| H}
+\sum_{b,t,h}
+\left|g_{b,t,h}^{\mathrm{eff}}\right|
+H_{\mathrm{norm}}(p_{b,t,h})
 $$
-
-where:
 
-- $\lambda_{\text{sparse}}$ = `structured_xattn_sparse_weight`
+This is exactly what `structured_xattn_sparse_weight` multiplies in the total
+loss. Lower values mean sharper square attention on tokens/heads where the
+structured gate is actually open.
 
-## 10. Square-Usage Diversity Loss
+## 10. Square-Diversity Metric
 
-Token-level sparsity alone can collapse the whole layer onto one square. To
-counter that, we also track the mean square usage across valid text tokens:
+First compute a gate-weighted average square-usage distribution for each head:
 
 $$
-u_i = \frac{1}{|V|} \sum_{b,t} m_{b,t} p_{b,t,i}^{\text{sq}}
+w_{b,t,h} = \left|g_{b,t,h}^{\mathrm{eff}}\right|
 $$
 
-So:
-
 $$
-\sum_i u_i = 1
+\bar{p}_{h,i} =
+\frac{\sum_{b,t} w_{b,t,h} p_{b,t,h,i}}
+{\sum_{b,t} w_{b,t,h}}
 $$
 
-and $u \in \mathbb{R}^{64}$ is the aggregate square-usage distribution for the layer.
+Then compute the normalized usage entropy per head:
 
-Its entropy is:
-
 $$
-H_{\text{usage}} = - \sum_i u_i \log u_i
+U_h = -\frac{\sum_i \bar{p}_{h,i} \log \bar{p}_{h,i}}{\log 64}
 $$
 
-Normalized:
+The layer-level usage entropy cached for logging is the gate-weighted average:
 
 $$
-H_{\text{usage\_norm}} = \frac{H_{\text{usage}}}{\log 64}
+U_{\mathrm{layer}} = \frac{\sum_h W_h U_h}{\sum_h W_h}
 $$
 
-The diversity penalty is a floor, not a matching-to-uniform loss:
+where
 
 $$
-L_{\text{div}} = \max(0, \tau - H_{\text{usage\_norm}})
+W_h = \sum_{b,t} w_{b,t,h}
 $$
-
-where:
 
-- $\tau \in [0,1]$ is the target normalized entropy floor
+The diversity loss for one layer is:
 
-Interpretation:
-
-- if square usage is already diverse enough ($H_{\text{usage\_norm}} \ge \tau$), then
-  $L_{\text{div}} = 0$
-- if usage collapses too far, the loss grows linearly as entropy falls below the
-  target
-
-Config/live-control scalars:
-
-- `structured_xattn_square_diversity_weight`
-- `structured_xattn_square_diversity_target_entropy`
-
-Contribution to total auxiliary loss:
-
 $$
-\lambda_{\text{div}} L_{\text{div}}
+L_{\mathrm{div}}^{\mathrm{layer}} =
+\operatorname{mean}_{b,t,h}(w_{b,t,h})
+\cdot
+\operatorname{relu}(\mathrm{target\_entropy} - U_{\mathrm{layer}})
 $$
 
-where:
+with `target_entropy = structured_xattn_square_diversity_target_entropy`,
+clamped to $[0, 1]$.
 
-- $\lambda_{\text{div}}$ = `structured_xattn_square_diversity_weight`
-- $\tau$ = `structured_xattn_square_diversity_target_entropy`
+This keeps the regularizer weak when the structured path is mostly closed, while
+penalizing collapse to the same few squares once the model is actively using the
+structured branch.
 
-## 11. Gate-Usage Floor Loss
+## 11. Gate-Usage Loss
 
-The token-conditioned gate path creates a failure mode where the model could
-learn to turn chess injection off almost everywhere. To discourage that, the
-implementation also tracks the mean absolute effective gate:
+The mean absolute gate usage for one layer is:
 
 $$
-\bar{g}_{\text{abs}} = \frac{1}{|V|H} \sum_{b,t,h} m_{b,t} \left| g_{b,t,h}^{\text{eff}} \right|
+G_{\mathrm{layer}} = \operatorname{mean}_{b,t,h}\left|g_{b,t,h}^{\mathrm{eff}}\right|
 $$
 
-and applies a weak hinge loss:
+The corresponding hinge loss is:
 
 $$
-L_{\text{gate}} = \max(0, \gamma - \bar{g}_{\text{abs}})
+L_{\mathrm{gate}}^{\mathrm{layer}} =
+\operatorname{relu}(\mathrm{target\_usage} - G_{\mathrm{layer}})
 $$
 
-where:
+with `target_usage = structured_xattn_gate_usage_target`, clamped to $[0, 1]$.
 
-- $\gamma$ = `structured_xattn_gate_usage_target`
-- the whole term is scaled by `structured_xattn_gate_usage_weight`
+## 12. Loss Composition Across Layers
 
-This is intentionally weak. It does not force every token to use chess, it only
-pushes against the degenerate solution where effective gates stay near zero
-everywhere.
+Across all active fusion layers in `structured_cross_attn` mode:
 
-## 12. Total Routing Auxiliary Loss
+- `structured_xattn_sparse_loss` is the mean of $L_{\mathrm{sparse}}^{\mathrm{layer}}$
+- `structured_xattn_square_diversity_loss` is the mean of $L_{\mathrm{div}}^{\mathrm{layer}}$
+- `structured_xattn_gate_usage_loss` is the mean of $L_{\mathrm{gate}}^{\mathrm{layer}}$
 
-The structured-mixer routing contribution is:
+The training loss adds:
 
 $$
-L_{\text{router}} =
-\lambda_{\text{sparse}} L_{\text{sparse}}
-+ \lambda_{\text{div}} L_{\text{div}}
-+ \lambda_{\text{gate}} L_{\text{gate}}
+\mathrm{structured\_xattn\_sparse\_weight}
+\cdot
+\mathrm{structured\_xattn\_sparse\_loss}
 $$
-
-This is added into the model's larger auxiliary objective together with policy,
-move-eval, BSR, and SPP losses:
 
 $$
-L_{\text{aux\_total}} =
-\dots + \lambda_{\text{sparse}} L_{\text{sparse}}
-+ \lambda_{\text{div}} L_{\text{div}}
-+ \lambda_{\text{gate}} L_{\text{gate}}
++\;
+\mathrm{structured\_xattn\_square\_diversity\_weight}
+\cdot
+\mathrm{structured\_xattn\_square\_diversity\_loss}
 $$
-
-Important:
-
-- the sparse term acts on per-token square marginals
-- the diversity term acts on the layer-level mean square usage
-- the gate term acts on the mean absolute effective head gate
-- neither term directly enforces balance across the three source types
-
-## 13. Logged Metrics
 
-The code exposes both the old slot-level diagnostics and the new square-level
-diagnostics.
-
-### Slot-level diagnostics
-
-These still describe the full $64 N_{\text{src}}$-way routing distribution:
-
-- `slot_mean`
-- `slot_entropy`
-- `source_mass`
-- `max_slot_index`
-- `max_slot_source_index`
-- `max_slot_square_index`
-- `max_slot_mass`
-
-### Square-level diagnostics
-
-These describe the source-marginalized 64-square routing:
-
-- `square_mean_i` $= \frac{1}{|V|} \sum_{b,t} m_{b,t} p_{b,t,i}^{\text{sq}}$
-- `square_entropy`
-- `square_entropy_norm`
-- `square_usage_entropy`
-- `square_usage_entropy_norm`
-- `max_square_index`
-- `max_square_mass`
-
-The most directly useful live metrics are:
-
-- `structured_xattn/.../square_entropy_norm`
-  - low means token-level square routing is sharp
-- `structured_xattn/.../square_usage_entropy_norm`
-  - low means the layer is collapsing onto a small set of squares
-- `train/structured_xattn_sparse_loss`
-  - the normalized per-token square entropy actually used in loss
-- `train/structured_xattn_square_diversity_loss`
-  - the hinge penalty below the target diversity floor
-- `train/structured_xattn_square_usage_entropy`
-  - the current normalized aggregate square-usage entropy
-- `structured_xattn/.../effective_gate_abs_mean`
-  - average absolute effective gate after combining static and token-conditioned gates
-- `structured_xattn/.../token_gate_logit_mean`
-  - mean token-gate logit emitted by the router stem
-- `train/structured_xattn_gate_usage_loss`
-  - hinge penalty that activates when chess injection is being suppressed too much
-- `train/structured_xattn_gate_usage_mean_abs`
-  - the actual mean absolute effective gate used by that penalty
-
-## 14. Practical Reading Of The Three Regularizers
-
-The intended regime is:
-
-- $L_{\text{sparse}}$ low enough that each token chooses a small number of squares
-- $H_{\text{usage\_norm}}$ high enough that the whole layer does not always choose the
-  same square
-- $\bar{g}_{\text{abs}}$ high enough that the model still uses chess when it needs to
-
-In other words:
-
-- sparsity answers "how many squares does one token use?"
-- diversity answers "do different tokens spread their attention over different
-  squares?"
-- gate usage answers "is the model silently turning chess injection off?"
-
-That combination is why the current design uses:
-
-- square-marginal sparsity
-- square-usage diversity
-- weak gate-usage floor
-- no explicit source-diversity regularizer
-
-The source types are semantically asymmetric (`csmp`, `perc`, `pol`), so
-forcing them toward equal usage would be a different inductive bias from the one
-implemented here.
+$$
++\;
+\mathrm{structured\_xattn\_gate\_usage\_weight}
+\cdot
+\mathrm{structured\_xattn\_gate\_usage\_loss}
+$$
 
-## 15. Mapping The Math To The Decode Inspector GUI
+## 13. Inspector And Logging Tensors
 
-The browser inspector in [decoding_inspector.md](decoding_inspector.md) is a
-direct visualization of the quantities defined in this document.
+The structured inspector and training logs are derived from real attention
+weights, not router logits.
 
-The mapping is:
+Important cached quantities include:
 
-- `Top-5 next tokens`
-  - the current decoder softmax over next-token logits
-- `CSMP`, `Perceiver`, and `Policy` boards
-  - the aligned source blocks inside the `64 * N_src` slot distribution
-- `Aggregate` board
-  - the source-marginalized square distribution
-    $p_i^{sq} = \sum_s \alpha_{s,i}$
-- head dropdown
-  - `All Heads` shows the mean-over-heads trace
-  - individual heads show the selected head's own square/global routing when
-    `xattn_structured_router_mode: per_head`
-- view dropdown
-  - `Mean Router` shows the backward-compatible mean over per-head router distributions
-  - `Gate-Weighted Router` reweights those per-head router distributions by
-    `|g_{b,t,h}^{eff}|`
-  - `Contribution Norm` shows normalized post-gate, post-`O` contribution
-    magnitudes rather than raw router probabilities
-- layer dropdown
-  - chooses which fusion layer's structured routing trace is displayed
-- trace metadata
-  - shows router mode plus effective gate / token-gate statistics for the last
-    valid token
+- `slot_mean`: mean attention over all $64 N_{\mathrm{src}}$ square slots
+- `source_mass`: source-marginal mass for each active square source
+- `square_mean`: 64-square source-marginal attention distribution
+- `global_mean`: mean 2-way global attention distribution
+- `effective_gate_abs_mean`: mean absolute effective gate usage
+- `token_gate_logit_mean`: mean token-conditioned gate logit when enabled
 
-Important detail:
+The decode inspector additionally caches last-token traces for:
 
-- the GUI shows the selected layer's routing for the last valid text token in
-  the current decode step, not an average over the whole sequence
+- mean square attention
+- per-head square attention
+- gate-weighted attention views
+- normalized post-gate contribution norms after `o_proj`
 
-So this document answers "what is the exact computation?" while the GUI answers
-"what did the model just do on this concrete position and token?"
+So the GUI answers "which squares and sources did this token read from?" using
+the actual structured cross-attention executed at runtime.

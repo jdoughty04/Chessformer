@@ -10,6 +10,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from inference import decoding_inspector as decoding_inspector_module
 from inference.decoding_inspector import DecodeSession
 from training.train import ChessCommentaryModel
 
@@ -50,9 +51,11 @@ def make_trace(
     per_head: bool = False,
     num_heads: int = 4,
     engineered: bool = False,
+    source_labels: list[str] | None = None,
 ):
-    source_labels = ["csmp", "perceiver", "policy"]
-    if engineered:
+    if source_labels is None:
+        source_labels = ["csmp", "perceiver", "policy"]
+    if engineered and "engineered" not in source_labels:
         source_labels.append("engineered")
     raw_slot_weights = torch.zeros(64 * len(source_labels), dtype=torch.float32)
     raw_slot_weights[slot_index] = 1.0
@@ -68,22 +71,16 @@ def make_trace(
             "aggregate_square_contribution_norms": source_square_contribution_norms.sum(dim=0),
             "global_contribution_norms": torch.tensor([0.12, 0.08], dtype=torch.float32),
             "last_token_index": torch.tensor(0, dtype=torch.long),
-            "csmp_square_weights": source_square_weights[0].clone(),
-            "perceiver_square_weights": source_square_weights[1].clone(),
-            "policy_square_weights": source_square_weights[2].clone(),
-            "csmp_square_contribution_norms": source_square_contribution_norms[0].clone(),
-            "perceiver_square_contribution_norms": source_square_contribution_norms[1].clone(),
-            "policy_square_contribution_norms": source_square_contribution_norms[2].clone(),
             "router_mode": "shared",
             "source_labels": source_labels,
             "effective_head_gates": torch.zeros(num_heads, dtype=torch.float32),
             "token_gate_logits": torch.zeros(num_heads, dtype=torch.float32),
         }
     }
-    if engineered:
-        trace[layer_idx]["engineered_square_weights"] = source_square_weights[3].clone()
-        trace[layer_idx]["engineered_square_contribution_norms"] = (
-            source_square_contribution_norms[3].clone()
+    for source_idx, label in enumerate(source_labels):
+        trace[layer_idx][f"{label}_square_weights"] = source_square_weights[source_idx].clone()
+        trace[layer_idx][f"{label}_square_contribution_norms"] = (
+            source_square_contribution_norms[source_idx].clone()
         )
     if per_head:
         raw_slot_weights_per_head = torch.stack([raw_slot_weights.roll(shifts=h) for h in range(num_heads)], dim=0)
@@ -123,38 +120,15 @@ def make_trace(
             trace[layer_idx]["source_square_contribution_norms"].sum(dim=0)
         )
         trace[layer_idx]["global_contribution_norms"] = global_contribution_norms_per_head.mean(dim=0)
-        trace[layer_idx]["csmp_square_weights_per_head"] = source_square_weights_per_head[:, 0].clone()
-        trace[layer_idx]["perceiver_square_weights_per_head"] = source_square_weights_per_head[:, 1].clone()
-        trace[layer_idx]["policy_square_weights_per_head"] = source_square_weights_per_head[:, 2].clone()
-        if engineered:
-            trace[layer_idx]["engineered_square_weights_per_head"] = (
-                source_square_weights_per_head[:, 3].clone()
+        for source_idx, label in enumerate(source_labels):
+            trace[layer_idx][f"{label}_square_weights_per_head"] = (
+                source_square_weights_per_head[:, source_idx].clone()
             )
-        trace[layer_idx]["csmp_square_contribution_norms_per_head"] = (
-            source_square_contribution_norms_per_head[:, 0].clone()
-        )
-        trace[layer_idx]["perceiver_square_contribution_norms_per_head"] = (
-            source_square_contribution_norms_per_head[:, 1].clone()
-        )
-        trace[layer_idx]["policy_square_contribution_norms_per_head"] = (
-            source_square_contribution_norms_per_head[:, 2].clone()
-        )
-        if engineered:
-            trace[layer_idx]["engineered_square_contribution_norms_per_head"] = (
-                source_square_contribution_norms_per_head[:, 3].clone()
+            trace[layer_idx][f"{label}_square_contribution_norms_per_head"] = (
+                source_square_contribution_norms_per_head[:, source_idx].clone()
             )
-        trace[layer_idx]["csmp_square_contribution_norms"] = (
-            trace[layer_idx]["source_square_contribution_norms"][0].clone()
-        )
-        trace[layer_idx]["perceiver_square_contribution_norms"] = (
-            trace[layer_idx]["source_square_contribution_norms"][1].clone()
-        )
-        trace[layer_idx]["policy_square_contribution_norms"] = (
-            trace[layer_idx]["source_square_contribution_norms"][2].clone()
-        )
-        if engineered:
-            trace[layer_idx]["engineered_square_contribution_norms"] = (
-                trace[layer_idx]["source_square_contribution_norms"][3].clone()
+            trace[layer_idx][f"{label}_square_contribution_norms"] = (
+                trace[layer_idx]["source_square_contribution_norms"][source_idx].clone()
             )
         trace[layer_idx]["effective_head_gates"] = torch.linspace(0.1, 0.4, steps=num_heads)
         trace[layer_idx]["token_gate_logits"] = torch.linspace(-0.2, 0.1, steps=num_heads)
@@ -163,9 +137,12 @@ def make_trace(
 
 class StubAdapter:
     def __init__(self, trace_sequence):
-        self.xattn_layer_indices = [7]
         self.trace_sequence = list(trace_sequence)
         self.current_trace = self.trace_sequence[0] if self.trace_sequence else {}
+        if self.current_trace:
+            self.xattn_layer_indices = sorted(int(layer_idx) for layer_idx in self.current_trace.keys())
+        else:
+            self.xattn_layer_indices = [7]
         self.clear_calls = 0
 
     def clear_last_token_traces(self) -> None:
@@ -261,6 +238,44 @@ class CountingContext:
 def _build_session(logits_sequence):
     trace_sequence = [make_trace(7, idx) for idx in range(len(logits_sequence))]
     return DecodeSession(StubModel(logits_sequence, trace_sequence))
+
+
+def test_load_config_for_inspector_accepts_canonical_and_legacy_structured_modes(monkeypatch):
+    monkeypatch.setattr(
+        decoding_inspector_module,
+        "detect_model_config",
+        lambda _checkpoint_path: SimpleNamespace(mode="chess_fusion"),
+    )
+    monkeypatch.setattr(
+        decoding_inspector_module,
+        "_set_inference_chess_fusion_load_defaults",
+        lambda _config: None,
+    )
+    monkeypatch.setattr(
+        decoding_inspector_module,
+        "_maybe_disable_unused_maia_backbone_for_inference",
+        lambda _config: None,
+    )
+
+    for xattn_mode in ("structured_cross_attn", "structured_square_mixer"):
+        checkpoint_cfg = SimpleNamespace(
+            chess_fusion=SimpleNamespace(xattn_mode=xattn_mode),
+            mode="ignored",
+            use_torch_compile=True,
+            load_in_8bit=True,
+        )
+        monkeypatch.setattr(
+            decoding_inspector_module,
+            "_load_checkpoint_config",
+            lambda _checkpoint_path, cfg=checkpoint_cfg: (cfg, None, None, None, None),
+        )
+
+        loaded = decoding_inspector_module._load_config_for_inspector(Path.cwd())
+
+        assert loaded.mode == "chess_fusion"
+        assert loaded.chess_fusion.xattn_mode == xattn_mode
+        assert loaded.use_torch_compile is False
+        assert loaded.load_in_8bit is False
 
 
 def test_decode_session_prime_returns_top_tokens_before_any_step():
@@ -428,6 +443,56 @@ def test_decode_session_serializes_engineered_source_trace_metadata():
     assert len(trace["engineered_contrib_64"]) == 64
     assert len(trace["engineered_per_head_64"]) == 4
     assert len(trace["engineered_contrib_per_head_64"]) == 4
+
+
+def test_decode_session_serializes_engineered_only_trace_metadata():
+    trace_sequence = [make_trace(7, 17, per_head=True, source_labels=["engineered"])]
+    model = StubModel([[0.1, 0.4, 2.5, 0.3, -0.2, 0.0]], trace_sequence)
+    session = DecodeSession(model)
+
+    snapshot = session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+    trace = snapshot["layer_traces"]["7"]
+
+    assert trace["source_labels"] == ["engineered"]
+    assert len(trace["engineered_64"]) == 64
+    assert len(trace["engineered_contrib_64"]) == 64
+    assert len(trace["engineered_per_head_64"]) == 4
+    assert len(trace["engineered_contrib_per_head_64"]) == 4
+    assert "csmp_64" not in trace
+    assert "perceiver_64" not in trace
+    assert "policy_64" not in trace
+
+
+def test_decode_session_serializes_multiple_layer_traces():
+    multi_layer_trace = {}
+    multi_layer_trace.update(make_trace(7, 5, per_head=True))
+    multi_layer_trace.update(make_trace(9, 11, per_head=True))
+    model = StubModel([[0.1, 0.4, 2.5, 0.3, -0.2, 0.0]], [multi_layer_trace])
+    session = DecodeSession(model)
+
+    snapshot = session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+
+    assert snapshot["available_layers"] == [7, 9]
+    assert set(snapshot["layer_traces"].keys()) == {"7", "9"}
+    assert len(snapshot["layer_traces"]["7"]["aggregate_per_head_64"]) == 4
+    assert len(snapshot["layer_traces"]["9"]["aggregate_per_head_64"]) == 4
+
+
+def test_html_page_assigns_piece_classes_to_match_piece_colors():
+    html = decoding_inspector_module.HTML_PAGE
+
+    assert '.piece.white {' in html
+    assert '.piece.black {' in html
+    assert 'const pieceClass = piece && piece === piece.toLowerCase() ? "piece black" : "piece white";' in html
+
+
+def test_html_page_exposes_all_layers_aggregation_controls():
+    html = decoding_inspector_module.HTML_PAGE
+
+    assert 'const ALL_LAYERS_VALUE = "__all_layers__";' in html
+    assert 'All Layers' in html
+    assert 'function aggregateLayerTraces(layerTraces)' in html
+
 
 
 class FakeGenerateLLM:

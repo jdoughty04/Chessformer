@@ -1,21 +1,26 @@
 # ChessFormer
 
-This project explores LLM multimodality in the structured domain of chess. Rather than forcing chess tokens into a language model's prompt or feeding it high-level engine breakdowns, this project lets the LLM reason about positions directly with a chess-specific cross-attention fusion architecture, aiming for natively multimodal, deep chess understanding.
+This is an experimentation-focused project that aims to build a language model with native chess multimodal understanding. Rather than forcing a language model to reason about chess as text tokens, this project designs a chess-specific deep fusion architecture that enables the LLM to selectively inject structured chess information deep within it's reasoning layers to focus on specific aspects of the position.
 
-## Project Goals
+## Main Project Details
 
-- **Native chess processing**: the model sees the board as 64 structured square tokens, not as text or a single pooled embedding
-- **Chess-grounded latent space**: auxiliary chess objectives (policy distillation, move evaluation, board reconstruction) shape the encoder's representations before they ever reach the LLM
-- **Decoder-side fusion**: chess state is injected into selected LLM layers via gated cross-attention, so the model can attend to specific squares while generating commentary
+- **Native chess architecture**: a specialized chess-encoder processes the position to produce 64 square latents. It implements chess relational attention mechanisms among other structured encoding mechanisms to preserve square-centric identity, supporting strong representations and interpretability probing.
+
+- **Auxiliary objectives**: auxiliary chess objectives (maia policy distillation, move evaluation, board reconstruction) use square-level prediction heads, enabling structured representation learning to support the primary task of generating commentary.
+
+- **Decoder-side fusion**: chess latents are injected into the LLM's decoder layers via dynamically gated cross-attention. Based on the current text latents, the model learns the kinds and amounts of chess information to inject. A decoding inspector provides visualizations of the model's attention patterns to the chess latents while decoding.
+
+- **Commentary regimes**: Chess commentary is supplied by [Synthetic Commentary Generation](https://github.com/TODO/synthetic_commentary_generation) and potentially[Chessvisor](https://github.com/TODO/chessvisor). Using LLM augmented tools, we can curate multiple viable training curricula, from low-entropy factoids to chatbot-style Q&A/coaching.
 
 ## Current State
 
-Current efforts have aimed to train on low-entropy factoid-style commentary, to achieve native multimodal understanding and set the stage for more sophisticated commentary styles. Given a board state, it generates commentary that demonstrates high accuracy on state-driven observations with few errors:
+Current efforts have aimed to train the model on low-entropy factoid-based commentary. This achieves solid state-grounded chess multimodality, setting the stage for more abstract, humanlike commentary styles. Given a board state, it generates commentary that demonstrates high accuracy on state-driven observations with few errors:
 
-> Black's pawn on f6 threatens White's queen on g5. White's pawn on h4 protects White's queen on g5. White has a semi-open f-file. Black's pawn on b6 attacks White's pawn on c5. Black's pawn on a2 puts pressure on White's pawn on b3. White's queen on g5 threatens Black's rook on g6. White's queen on g5 puts pressure on Black's pawn on h4. White's pawn on c5 puts pressure on Black's pawn on d6. Black's knight on b4 puts pressure on White's pawn on d3. Black's pawn on d5 guards Black's pawn on e4. White's pawn on b3 puts pressure on Black's pawn on a4. Black has a semi-open g-file. Black's knight on b4 threatens White's pawn on c2. Black's knight on h7 is on the rim. White's bishop on e2 puts pressure on Black's pawn on d3. Black's rook on g6 is on a semi-open file. Black's pawn on a4 puts pressure on White's pawn on b3. White's queen on g5 guards White's pawn on g3 and White's pawn on h4. Black has a semi-open a-file. Black's knight on h7 protects Black's pawn on f6. Black's knight on b4 protects Black's pawn on a2 and Black's pawn on d5. Black's rook on g6 puts pressure on White's queen on g5. Black's knight on h7 puts pressure on White's queen on g5. White's rook on h3 protects White's pawn on g3 and White's pawn on h4. White's bishop on e2 guards White's pawn on d3. Black's rook on g6 protects Black's pawn on f6. White has a semi-open b-file. White is close to winning. White has a material advantage of significant material. fxg
+> Black's knight on g3 threatens White's rook on h1. Black's pawn on a3 is attacking White's pawn on b2. White's pawn on b2 threatens Black's pawn on a3. White's queen on b3 is attacking Black's knight on b8 and Black's pawn on a3. White's pawn on f2 attacks Black's knight on g3. White's pawn on h2 is attacking Black's knight on g3. Black's knight on g3 supports Black's bishop on a6. White's pawn on d5 is attacking Black's pawn on c6. Black has a semi-open b-file. White's king on g1 guards White's rook on h1, White's pawn on f2, and White's pawn on h2. White's pawn on a2 supports White's queen on b3. Black's pawn on c6 attacks White's pawn on d5. White's king is castled kingside. White's knight on h3 is on the rim. Black's bishop on f8 guards Black's pawn on d6 and Black's pawn on g7. White's king has a weakened pawn shield. Black's queen on e5 threatens White's bishop on g5, White's pawn on e2, White's pawn on b2, and White's pawn on d5. White's pawn on e2 defends White's bishop on f3. Black has a semi-open e-file. White's knight on h3 protects White's king on g1, White's pawn on f2, and White's bishop on g5. Black's bishop on a6 is attacking White's pawn on e2. White's rook on h1 guards White's king on g1 and White's pawn on h2. Black's queen on e5 guards Black's knight on g3, Black's pawn on d6, and Black's pawn on g7. Black's king remains in the center on d7. 
 
 
-![position](position.png)
+
+![position](assets/position.png)
 
 This lays the foundation for further work toward learning more abstract, human-like commentary styles.
 
@@ -41,7 +46,7 @@ Structured Perceiver (64 square latents + 1 global)
     v
 LLM Decoder Fusion
   - gated cross-attention at selected decoder layers
-  - structured square mixer: each text token routes to 64x3 aligned slots
+  - structured square mixer: each text token routes to 64x4 aligned slots
   - optional prepended chess latents as prefix embeddings
     |
     v
@@ -50,15 +55,15 @@ Commentary Output (TinyLlama 1.1B + LoRA)
 
 ## Training Data
 
-Training data is generated by the companion [Synthetic Commentary Generation](https://github.com/TODO/synthetic_commentary_generation) repository, which handles PGN sampling, engine analysis, motif detection, importance scoring, and LLM-based commentary synthesis. Exported `.pt` samples are consumed directly by the training loop here.
+Training data is generated by the companion [Synthetic Commentary Generation](https://github.com/TODO/synthetic_commentary_generation) repository, which uses methods such as commentary templates, engine analysis, motif detection, importance scoring, and LLM-based commentary synthesis. Exported `.pt` samples are consumed directly by the training loop here.
 
 ## Documentation
 
 - [Architecture Deep Dive](docs/architecture.md) — detailed component breakdown, CSMP modes, Perceiver regime, fusion strategies
 - [Training Guide](docs/training.md) — config walkthrough, training regimes, how to run
 - [Data Pipeline](docs/data_pipeline.md) — sample contract, data flow from PGN to training
-- [Structured Square Mixer Math](docs/structured_square_mixer_math.md) — exact forward equations and routing regularizers
-- [Structured Decode Inspector](docs/decoding_inspector.md) — browser GUI for token-by-token commentary decoding and `64 x 3` routing visualization
+- [Structured Cross-Attn Math](docs/structured_square_mixer_math.md) - exact forward equations and structured square-attention regularizers
+- [Structured Decode Inspector](docs/decoding_inspector.md) - browser GUI for token-by-token commentary decoding and `64 x N_src` square-attention visualization
 
 ## Quick Start
 
@@ -72,7 +77,7 @@ python src/training/train.py --config configs/chess_fusion.yaml
 # Set model.enable_lm: false in the config
 python src/training/train.py --config configs/chess_fusion.yaml
 
-# Inspect a saved structured_square_mixer checkpoint in the browser
+# Inspect a saved structured_cross_attn checkpoint in the browser
 python src/inference/decoding_inspector.py --checkpoint <checkpoint_dir>
 ```
 

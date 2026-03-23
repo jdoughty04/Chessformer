@@ -136,26 +136,27 @@ class ChessFusionConfig:
     structured_policy_ffn_mult: int = 2
     structured_policy_use_move_bias: bool = True
     
-    # Shared layer-conditioned readout (legacy recurrent_query_attn path only;
-    # ignored when xattn_mode='structured_square_mixer')
+    # Legacy shared readout config. Deprecated and ignored by the hidden-state
+    # x-attn paths, but kept for config compatibility with older checkpoints.
     num_fusion_tokens: int = 16          # Number of learned latents in shared readout (output tokens for LLM cross-attention)
     readout_depth: int = 1               # Number of (text-xattn â†’ policy-xattn[opt] â†’ perc-xattn â†’ csmp-xattn â†’ self-attn â†’ FFN) layers in shared readout
-    shared_readout_fourier_dim: int = 64 # Dimension of Fourier encoding for layer fraction conditioning
+    shared_readout_fourier_dim: int = 64 # Deprecated compatibility field for old shared-readout checkpoints
     readout_use_policy_latent_cross_attention: bool = False  # If True, add policy-latent cross-attention before perceiver xattn in shared readout
     
     # Decoder-layer chess fusion in the LLM
     xattn_layers: List[int] = field(default_factory=lambda: [5, 11, 17])
-    xattn_mode: Literal["recurrent_query_attn", "structured_square_mixer"] = "recurrent_query_attn"
+    xattn_mode: Literal["cross_attn", "structured_cross_attn", "recurrent_query_attn", "structured_square_mixer"] = "cross_attn"
     xattn_heads: int = 16
     xattn_gate_init: float = 0.0         # tanh gate init value (0 = identity at start)
-    xattn_structured_router_mode: Literal["shared", "per_head"] = "shared"  # structured mixer: shared slot router or independent per-head routers
-    xattn_text_gate_mode: Literal["none", "tanh_head"] = "tanh_head"  # structured mixer only: optional token-conditioned per-head tanh gate logits
-    xattn_structured_use_engineered_source: bool = False  # structured mixer only: add main engineered square features as a fourth router source
+    xattn_structured_router_mode: Literal["shared", "per_head"] = "per_head"  # deprecated compatibility field; structured_cross_attn always uses per-head attention
+    xattn_text_gate_mode: Literal["none", "tanh_head"] = "tanh_head"  # structured_cross_attn only: optional token-conditioned per-head tanh gate logits
+    xattn_structured_use_engineered_source: bool = False  # structured_cross_attn only: add 205-dim main engineered square features as a fourth structured source
+    engineered_only_xattn_ablation: bool = False  # structured_cross_attn ablation: skip backbone/CSMP/Perceiver and train x-attn from engineered features alone
     xattn_dropout: float = 0.1           # Dropout in xattn attention + FFN
     xattn_ffn_mult: int = 2              # FFN expansion multiplier in xattn (2x instead of 4x)
-    xattn_recurrent_query_state_dim: int = 256 # GRU hidden size for recurrent-query state used by both fusion modes
-    xattn_recurrent_query_use_mlp: bool = False # If True, use MLP heads (instead of linear) from recurrent state
-    xattn_recurrent_query_share_gru_across_layers: bool = False # Share recurrent-query GRU across all x-attn layers (projections remain per-layer)
+    xattn_recurrent_query_state_dim: int = 256 # deprecated compatibility field; ignored
+    xattn_recurrent_query_use_mlp: bool = False # deprecated compatibility field; ignored
+    xattn_recurrent_query_share_gru_across_layers: bool = False # deprecated compatibility field; ignored
     enable_lm_prepend_latents: bool = False  # If True, prepend learned chess latents into LLM text embedding stream
     num_lm_prepend_latents: int = 16         # Number of prepended learned latents (must be >0 when enabled)
     lm_prepend_latent_mode: Literal["cross_attn", "structured_mlp"] = "cross_attn"
@@ -168,8 +169,8 @@ class ChessFusionConfig:
     # Auxiliary losses
     aux_policy_weight: float = 0.1       # KL div vs Maia policy
     aux_eval_weight: float = 0.0         # Deprecated position-eval bucket CE (kept for backward compatibility)
-    structured_xattn_sparse_weight: float = 0.0  # Entropy penalty on structured_square_mixer square marginals (lower = sparser over 64 squares)
-    structured_xattn_square_diversity_weight: float = 0.0  # Encourage aggregate square usage to stay above a target entropy floor
+    structured_xattn_sparse_weight: float = 0.0  # Entropy penalty on structured square-attention marginals (lower = sparser over 64 squares)
+    structured_xattn_square_diversity_weight: float = 0.0  # Encourage aggregate square attention usage to stay above a target entropy floor
     structured_xattn_square_diversity_target_entropy: float = 0.5  # Normalized target entropy floor in [0, 1] over mean 64-square usage
     structured_xattn_gate_usage_weight: float = 0.0  # Weak floor on mean absolute effective structured x-attn gate usage
     structured_xattn_gate_usage_target: float = 0.1  # Target mean |effective_gate| used by the hinge loss
@@ -217,7 +218,7 @@ class ChessFusionConfig:
     freeze_csmp: bool = False            # Freeze CSMP in multi_scale.chess_mp (when CSMP is enabled)
     freeze_perceiver: bool = False       # Freeze SquareLatentEncoder + multi_scale side_token embedding
     freeze_xattn: bool = False
-    freeze_prepend_latents: bool = False # Freeze prepend_latent_readout independently of xattn/shared_readout
+    freeze_prepend_latents: bool = False # Freeze prepend_latent_readout independently of decoder x-attn
     freeze_lm_pseudotokens: bool = False # Freeze only learnable LM pseudotokens (independent of freeze_xattn)
     
     # LR ratios

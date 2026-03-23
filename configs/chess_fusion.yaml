@@ -25,7 +25,7 @@ training:
 
   num_epochs: 10
   batch_size: 32                    # per-device batch size
-  gradient_accumulation_steps: 1    # effective batch = batch_size * accumulation
+  gradient_accumulation_steps: 4    # effective batch = batch_size * accumulation
   learning_rate: 1.0e-4
   gradient_clip_val: null           # null = no clipping
   warmup_ratio: 0.015              # fraction of total steps for LR warmup
@@ -35,7 +35,7 @@ training:
 
   # Prompt construction: what context the model sees alongside the position
   prepend_fen_in_prompt: false     # include raw FEN string in the text prompt
-  use_pgn_in_prompt: true          # include recent move history
+  use_pgn_in_prompt: false          # include recent move history
   pgn_prompt_last_n_moves: 5      # how many moves of history to include
 
   # Chess token weighting: upweight loss on chess-relevant tokens to improve
@@ -104,9 +104,9 @@ model:
     load_checkpoint_backbone: false
     load_checkpoint_csmp: true
     load_checkpoint_perceiver: true
-    load_checkpoint_xattn: false
+    load_checkpoint_xattn: true
     load_checkpoint_prepend_latents: true
-    load_checkpoint_lm_pseudotokens: false
+    load_checkpoint_lm_pseudotokens: true
     load_checkpoint_aux_heads: true
 
     # --- Front End: Board Encoding --------------------------------------------
@@ -173,7 +173,7 @@ model:
     structured_policy_use_move_bias: true
 
     # Legacy shared readout (kept for checkpoint compatibility, not actively used
-    # by structured_square_mixer mode).
+    # by the current hidden-state x-attn paths).
     num_fusion_tokens: 16
     readout_depth: 2
     shared_readout_fourier_dim: 64
@@ -184,25 +184,24 @@ model:
     # More layers = richer fusion but more parameters. A spread across the
     # network (early + late) lets the model use chess context at different
     # abstraction levels.
-    xattn_layers: [0, 4, 7, 11, 15, 18, 21]
+    xattn_layers: [11, 19, 20, 21]
 
-    # Fusion mode: structured_square_mixer routes each text token to 64x3
-    # aligned slots (CSMP, Perceiver, Policy per square). See
+    # Fusion mode: structured_cross_attn uses the current decoder hidden states
+    # as queries over 64x3 aligned square slots (CSMP, Perceiver, Policy) plus
+    # a separate 2-token global branch. See
     # docs/structured_square_mixer_math.md for the exact equations.
-    xattn_mode: structured_square_mixer
+    # Legacy aliases still load: recurrent_query_attn -> cross_attn and
+    # structured_square_mixer -> structured_cross_attn.
+    xattn_mode: structured_cross_attn
     xattn_heads: 16
     xattn_gate_init: 0.0           # initial gate value (0 = start with no chess signal)
-    xattn_structured_router_mode: per_head   # shared = one 192-way router per token; per_head = independent router per x-attn head
-    xattn_text_gate_mode: tanh_head        # tanh_head = per-token dynamic head gates from the router stem; none = static gates only
-    xattn_structured_use_engineered_source: false  # if true, add 204-dim main engineered square features as a fourth structured router source
+    xattn_structured_router_mode: per_head   # compatibility-only; shared is deprecated and is coerced to per_head
+    xattn_text_gate_mode: tanh_head        # tanh_head = per-token dynamic head gates from normalized layer hidden states; none = static gates only
+    xattn_structured_use_engineered_source: true  # if true, add 204-dim main engineered square features as a fourth structured square-attention source
+    engineered_only_xattn_ablation: false  # if true, skip backbone/CSMP/Perceiver, disable prepend/pseudotoken adapter paths, and drive structured x-attn from the Engineered source alone
     xattn_dropout: 0.1
     xattn_ffn_mult: 4
 
-    # Recurrent query parameters (used internally by the structured mixer
-    # to build per-token query states via GRU).
-    xattn_recurrent_query_state_dim: 1024
-    xattn_recurrent_query_use_mlp: true
-    xattn_recurrent_query_share_gru_across_layers: false
 
     # Prepended chess latents: project chess latents into the LLM embedding
     # space and prepend them as prefix tokens before the text.
@@ -216,7 +215,7 @@ model:
     # layer-specific learned context.
     enable_lm_pseudotokens: true
     num_lm_pseudotokens: 4
-    lm_pseudotoken_layers: [0, 4, 7, 11, 15, 18, 21]
+    lm_pseudotoken_layers: [0, 11, 18, 19, 20, 21]
 
     # --- Auxiliary Objectives -------------------------------------------------
 
@@ -225,32 +224,34 @@ model:
     use_precomputed_policy: true   # use cached maia_policy from .pt files
 
     # Deprecated position-bucket eval classifier (disabled, kept for compat).
-    aux_eval_weight: 0.0
+    aux_eval_weight: 0.1
     num_eval_buckets: 5
 
-    # Router regularization (structured square mixer only):
+    # Structured square-attention regularization:
     # Sparsity encourages each text token to focus on few squares.
-    # Diversity prevents all tokens from collapsing to the same squares.
+    # Sparsity/diversity are weighted by |effective_gate|, so nearly-closed
+    # heads/tokens do not pay the full regularization cost.
+    # Diversity prevents active square attention from collapsing to the same squares.
     # Gate-usage keeps the token-conditioned gates from collapsing to zero everywhere.
     structured_xattn_sparse_weight: 0.1
     structured_xattn_square_diversity_weight: 0.1
-    structured_xattn_square_diversity_target_entropy: 1.0
+    structured_xattn_square_diversity_target_entropy: 0.7
     structured_xattn_gate_usage_weight: 0.1
     structured_xattn_gate_usage_target: 0.1
 
     # Move evaluation objective: ranks and scores candidate moves using
     # engine evaluations from the training data. Requires move_evals in .pt files.
-    aux_move_eval_weight: 0.1      # set to 0 to disable
+    aux_move_eval_weight: 0.1     # set to 0 to disable
     move_eval_dim: 1024
     move_eval_cp_scale: 512.0      # normalize centipawn targets
     move_eval_cp_clip: 2000.0      # clip extreme values for stability
-    move_eval_mse_weight: 0.1      # MSE regression balance
-    move_eval_ce_weight: 0.001       # soft CE balance
-    move_eval_pairwise_weight: 0.001 # pairwise ranking balance
+    move_eval_mse_weight: 0.0      # MSE regression balance
+    move_eval_ce_weight: 0.0       # soft CE balance
+    move_eval_pairwise_weight: 0.0 # pairwise ranking balance
     move_eval_pairwise_topk: 5
     move_eval_pairwise_cp_margin: 10.0
-    move_eval_pairwise_temperature: 1.0
-    move_eval_mate_weight: 1.0     # mate classification balance
+    move_eval_pairwise_temperature: 0.0
+    move_eval_mate_weight: 0.01     # mate classification balance
     move_eval_mate_threshold_cp: 9000.0
     move_eval_ce_topk: 5
     move_eval_ce_cp_temperature: 128.0
@@ -260,25 +261,25 @@ model:
     bsr_dim: 256
     bsr_heads: 4
     bsr_layers: 1
-    bsr_dropout: 0.75
+    bsr_dropout: 0.1
 
     # Square Property Prediction: predict attack counts and ray distances.
     spp_weight: 0.5
     spp_dim: 256
     spp_heads: 4
     spp_layers: 1
-    spp_dropout: 0.75
+    spp_dropout: 0.1
 
     # --- Freeze / Unfreeze Schedule -------------------------------------------
     # Control which components are trainable. Useful for staged training:
     # e.g., first train encoder with chess objectives, then unfreeze LLM layers.
     freeze_cnn: true
     freeze_transformer: true
-    freeze_csmp: true
-    freeze_perceiver: true
-    freeze_xattn: true
+    freeze_csmp: false
+    freeze_perceiver: false
+    freeze_xattn: false
     freeze_prepend_latents: true
-    freeze_lm_pseudotokens: true
+    freeze_lm_pseudotokens: false
 
     # Per-component learning rate multipliers (relative to base LR).
     cnn_learning_rate: 0.0

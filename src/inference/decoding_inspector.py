@@ -116,10 +116,11 @@ def _load_config_for_inspector(checkpoint_path: Path):
     fusion_cfg = getattr(config, "chess_fusion", None)
     if fusion_cfg is None:
         raise ValueError("Checkpoint config does not include model.chess_fusion settings.")
-    if getattr(fusion_cfg, "xattn_mode", None) != "structured_square_mixer":
+    if getattr(fusion_cfg, "xattn_mode", None) not in {"structured_square_mixer", "structured_cross_attn"}:
         raise ValueError(
             "Structured decode inspector only supports checkpoints with "
-            "model.chess_fusion.xattn_mode='structured_square_mixer' "
+            "model.chess_fusion.xattn_mode in "
+            "{'structured_square_mixer', 'structured_cross_attn'} "
             f"(got {getattr(fusion_cfg, 'xattn_mode', None)!r})."
         )
 
@@ -311,62 +312,49 @@ class DecodeSession:
         raw_traces = self.model.adapter.get_last_token_structured_traces(sample_index=0)
         traces: dict[str, Any] = {}
         for layer_idx, trace in raw_traces.items():
+            source_labels = list(trace.get("source_labels", ["csmp", "perceiver", "policy"]))
             serialized = {
                 "aggregate_64": trace["aggregate_square_weights"].tolist(),
-                "csmp_64": trace["csmp_square_weights"].tolist(),
-                "perceiver_64": trace["perceiver_square_weights"].tolist(),
-                "policy_64": trace["policy_square_weights"].tolist(),
                 "global_2": trace["global_weights"].tolist(),
                 "raw_slot_192": trace["raw_slot_weights"].tolist(),
                 "last_token_index": int(trace["last_token_index"].item()),
-                "router_mode": trace.get("router_mode", "shared"),
-                "source_labels": list(trace.get("source_labels", ["csmp", "perceiver", "policy"])),
+                "router_mode": trace.get("router_mode", "per_head"),
+                "source_labels": source_labels,
                 "effective_head_gates": trace.get("effective_head_gates", torch.zeros(0)).tolist(),
                 "token_gate_logits": trace.get("token_gate_logits", torch.zeros(0)).tolist(),
             }
-            if "engineered_square_weights" in trace:
-                serialized["engineered_64"] = trace["engineered_square_weights"].tolist()
+            for source_label in source_labels:
+                square_key = f"{source_label}_square_weights"
+                if square_key in trace:
+                    serialized[f"{source_label}_64"] = trace[square_key].tolist()
             if "aggregate_square_contribution_norms" in trace:
                 serialized["aggregate_contrib_64"] = trace["aggregate_square_contribution_norms"].tolist()
-                serialized["csmp_contrib_64"] = trace["csmp_square_contribution_norms"].tolist()
-                serialized["perceiver_contrib_64"] = trace["perceiver_square_contribution_norms"].tolist()
-                serialized["policy_contrib_64"] = trace["policy_square_contribution_norms"].tolist()
                 serialized["global_contrib_2"] = trace["global_contribution_norms"].tolist()
-                if "engineered_square_contribution_norms" in trace:
-                    serialized["engineered_contrib_64"] = (
-                        trace["engineered_square_contribution_norms"].tolist()
-                    )
+                for source_label in source_labels:
+                    contrib_key = f"{source_label}_square_contribution_norms"
+                    if contrib_key in trace:
+                        serialized[f"{source_label}_contrib_64"] = trace[contrib_key].tolist()
             if "aggregate_square_weights_per_head" in trace:
                 serialized["aggregate_per_head_64"] = trace["aggregate_square_weights_per_head"].tolist()
-                serialized["csmp_per_head_64"] = trace["csmp_square_weights_per_head"].tolist()
-                serialized["perceiver_per_head_64"] = trace["perceiver_square_weights_per_head"].tolist()
-                serialized["policy_per_head_64"] = trace["policy_square_weights_per_head"].tolist()
                 serialized["global_per_head_2"] = trace["global_weights_per_head"].tolist()
                 serialized["raw_slot_per_head_192"] = trace["raw_slot_weights_per_head"].tolist()
-                if "engineered_square_weights_per_head" in trace:
-                    serialized["engineered_per_head_64"] = (
-                        trace["engineered_square_weights_per_head"].tolist()
-                    )
+                for source_label in source_labels:
+                    per_head_key = f"{source_label}_square_weights_per_head"
+                    if per_head_key in trace:
+                        serialized[f"{source_label}_per_head_64"] = trace[per_head_key].tolist()
             if "aggregate_square_contribution_norms_per_head" in trace:
                 serialized["aggregate_contrib_per_head_64"] = (
                     trace["aggregate_square_contribution_norms_per_head"].tolist()
                 )
-                serialized["csmp_contrib_per_head_64"] = (
-                    trace["csmp_square_contribution_norms_per_head"].tolist()
-                )
-                serialized["perceiver_contrib_per_head_64"] = (
-                    trace["perceiver_square_contribution_norms_per_head"].tolist()
-                )
-                serialized["policy_contrib_per_head_64"] = (
-                    trace["policy_square_contribution_norms_per_head"].tolist()
-                )
                 serialized["global_contrib_per_head_2"] = (
                     trace["global_contribution_norms_per_head"].tolist()
                 )
-                if "engineered_square_contribution_norms_per_head" in trace:
-                    serialized["engineered_contrib_per_head_64"] = (
-                        trace["engineered_square_contribution_norms_per_head"].tolist()
-                    )
+                for source_label in source_labels:
+                    per_head_contrib_key = f"{source_label}_square_contribution_norms_per_head"
+                    if per_head_contrib_key in trace:
+                        serialized[f"{source_label}_contrib_per_head_64"] = (
+                            trace[per_head_contrib_key].tolist()
+                        )
             traces[str(layer_idx)] = serialized
         return traces
 
@@ -819,12 +807,15 @@ HTML_PAGE = """<!DOCTYPE html>
       left: 6px;
       font-size: 1rem;
       font-weight: 800;
-      color: var(--cell-text);
+    }
+
+    .piece.white {
+      color: rgba(255, 250, 243, 0.96);
+      text-shadow: 0 1px 1px rgba(29, 19, 11, 0.45);
     }
 
     .piece.black {
-      color: rgba(255, 250, 243, 0.92);
-      text-shadow: 0 1px 1px rgba(29, 19, 11, 0.45);
+      color: var(--cell-text);
     }
 
     .weight {
@@ -898,7 +889,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <section class="hero">
       <div>
         <h1>Structured Decode Inspector</h1>
-        <p>Step through commentary generation token by token, move backward to earlier decode boundaries, inspect the live top-5 next-token distribution, and compare structured router views across mean, gate-weighted, and contribution-norm aggregation for the currently selected x-attn layer.</p>
+        <p>Step through commentary generation token by token, move backward to earlier decode boundaries, inspect the live top-5 next-token distribution, and compare structured router views across mean, gate-weighted, and contribution-norm aggregation for the currently selected x-attn layer or an all-layer average.</p>
       </div>
       <div class="controls">
         <div class="control">
@@ -948,6 +939,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <script>
     const DEFAULT_PROMPT = "Provide commentary on this chess position.";
+    const ALL_LAYERS_VALUE = "__all_layers__";
     const defaultSourceLabels = ["csmp", "perceiver", "policy"];
     const sourceTitleOverrides = {
       csmp: "CSMP",
@@ -1027,6 +1019,123 @@ HTML_PAGE = """<!DOCTYPE html>
       ];
     }
 
+    function isNumericTree(value) {
+      if (Array.isArray(value)) {
+        return value.every((item) => isNumericTree(item));
+      }
+      return typeof value === "number" && Number.isFinite(value);
+    }
+
+    function haveSameTreeShape(left, right) {
+      if (Array.isArray(left) !== Array.isArray(right)) {
+        return false;
+      }
+      if (!Array.isArray(left)) {
+        return true;
+      }
+      if (left.length !== right.length) {
+        return false;
+      }
+      return left.every((item, index) => haveSameTreeShape(item, right[index]));
+    }
+
+    function averageNumericTrees(values) {
+      if (!Array.isArray(values) || !values.length) {
+        return null;
+      }
+      if (Array.isArray(values[0])) {
+        return values[0].map((_value, index) => (
+          averageNumericTrees(values.map((item) => item[index]))
+        ));
+      }
+      return values.reduce((sum, value) => sum + Number(value || 0), 0) / values.length;
+    }
+
+    function averageTraceField(layerTraces, key) {
+      if (!Array.isArray(layerTraces) || !layerTraces.length) {
+        return null;
+      }
+      const candidateValues = layerTraces
+        .map((trace) => trace?.[key])
+        .filter((value) => isNumericTree(value));
+      if (!candidateValues.length) {
+        return null;
+      }
+      const reference = candidateValues[0];
+      const shapeMatched = candidateValues.filter((value) => haveSameTreeShape(reference, value));
+      if (!shapeMatched.length) {
+        return null;
+      }
+      return averageNumericTrees(shapeMatched);
+    }
+
+    function selectedLayerLabel() {
+      return String(selectedLayer) === ALL_LAYERS_VALUE ? "All Layers" : `Layer ${selectedLayer}`;
+    }
+
+    function collectSessionLayerTraces() {
+      const layerIds = Array.isArray(session?.available_layers) ? session.available_layers : [];
+      return layerIds
+        .map((layerId) => session?.layer_traces?.[String(layerId)] || null)
+        .filter((trace) => trace != null);
+    }
+
+    function aggregateLayerTraces(layerTraces) {
+      if (!Array.isArray(layerTraces) || !layerTraces.length) {
+        return null;
+      }
+
+      const firstTrace = layerTraces[0];
+      const sourceLabels = Array.from(new Set(layerTraces.flatMap((trace) => getSourceLabels(trace))));
+      const routerModes = Array.from(new Set(layerTraces.map((trace) => trace?.router_mode || "per_head")));
+      const aggregatedTrace = {
+        ...firstTrace,
+        source_labels: sourceLabels,
+        router_mode: routerModes.length === 1 ? routerModes[0] : "mixed",
+        layer_scope_label: "All Layers",
+      };
+      const aggregateKeys = new Set([
+        "aggregate_64",
+        "global_2",
+        "raw_slot_192",
+        "aggregate_per_head_64",
+        "global_per_head_2",
+        "raw_slot_per_head_192",
+        "aggregate_contrib_64",
+        "global_contrib_2",
+        "aggregate_contrib_per_head_64",
+        "global_contrib_per_head_2",
+        "effective_head_gates",
+        "token_gate_logits",
+      ]);
+      sourceLabels.forEach((label) => {
+        aggregateKeys.add(sourceBoardKey(label));
+        aggregateKeys.add(sourcePerHeadBoardKey(label));
+        aggregateKeys.add(sourceContributionKey(label));
+        aggregateKeys.add(sourceContributionPerHeadKey(label));
+      });
+
+      aggregateKeys.forEach((key) => {
+        const averaged = averageTraceField(layerTraces, key);
+        if (averaged != null) {
+          aggregatedTrace[key] = averaged;
+        } else {
+          delete aggregatedTrace[key];
+        }
+      });
+      return aggregatedTrace;
+    }
+
+    function traceForSelectedLayer() {
+      if (!session || !selectedLayer) {
+        return null;
+      }
+      if (String(selectedLayer) === ALL_LAYERS_VALUE) {
+        return aggregateLayerTraces(collectSessionLayerTraces());
+      }
+      return session.layer_traces?.[String(selectedLayer)] || null;
+    }
+
     function heatColor(isDark, intensity) {
       const base = isDark ? [183, 138, 88] : [246, 231, 206];
       const alpha = 0.12 + 0.76 * clamp(intensity, 0, 1);
@@ -1048,7 +1157,7 @@ HTML_PAGE = """<!DOCTYPE html>
           const value = Number(weights[index] || 0);
           const dark = (rank + file) % 2 === 1;
           const intensity = maxWeight > 0 ? value / maxWeight : 0;
-          const pieceClass = piece && piece === piece.toLowerCase() ? "piece black" : "piece";
+          const pieceClass = piece && piece === piece.toLowerCase() ? "piece black" : "piece white";
           const titleText = `${square} | ${valueLabel}=${value.toFixed(6)}`;
           cells += `
             <div class="square" data-square="${square}" title="${titleText}" style="background:${heatColor(dark, intensity)}">
@@ -1081,16 +1190,18 @@ HTML_PAGE = """<!DOCTYPE html>
         return;
       }
 
-      if (!selectedLayer || !layerStrings.includes(String(selectedLayer))) {
+      const validValues = [ALL_LAYERS_VALUE, ...layerStrings];
+      if (!selectedLayer || !validValues.includes(String(selectedLayer))) {
         selectedLayer = layerStrings[0];
       }
 
-      select.innerHTML = layerStrings.map((layer) => {
+      select.innerHTML = validValues.map((layer) => {
         const selected = String(layer) === String(selectedLayer) ? "selected" : "";
-        return `<option value="${layer}" ${selected}>Layer ${layer}</option>`;
+        const label = String(layer) === ALL_LAYERS_VALUE ? "All Layers" : `Layer ${layer}`;
+        return `<option value="${layer}" ${selected}>${label}</option>`;
       }).join("");
 
-      const trace = session?.layer_traces?.[String(selectedLayer)] || null;
+      const trace = traceForSelectedLayer();
       syncHeadOptions(trace);
       syncAggregationOptions(trace);
     }
@@ -1134,9 +1245,9 @@ HTML_PAGE = """<!DOCTYPE html>
         return;
       }
 
-      const options = [["mean_router", "Mean Router"]];
+      const options = [["mean_router", "Mean Attention"]];
       const hasPerHeadRouter = (
-        (trace.router_mode || "shared") === "per_head"
+        (trace.router_mode || "per_head") === "per_head"
         && Array.isArray(trace.aggregate_per_head_64)
         && trace.aggregate_per_head_64.length > 0
         && Array.isArray(trace.effective_head_gates)
@@ -1147,7 +1258,7 @@ HTML_PAGE = """<!DOCTYPE html>
         && trace.aggregate_contrib_64.length > 0
       );
       if (hasPerHeadRouter) {
-        options.push(["gate_weighted_router", "Gate-Weighted Router"]);
+        options.push(["gate_weighted_router", "Gate-Weighted Attention"]);
       }
       if (hasContributionView) {
         options.push(["contribution_norm", "Contribution Norm"]);
@@ -1169,8 +1280,8 @@ HTML_PAGE = """<!DOCTYPE html>
       if (selectedHead == null || String(selectedHead) === "all") {
         return {
           ...trace,
-          value_label: "router_mass",
-          view_mode_label: "Mean Router",
+          value_label: "attention_mass",
+          view_mode_label: "Mean Attention",
         };
       }
       const headIndex = Number(selectedHead);
@@ -1179,8 +1290,8 @@ HTML_PAGE = """<!DOCTYPE html>
         ...trace,
         aggregate_64: usePerHead("aggregate_per_head_64") || trace.aggregate_64,
         global_2: usePerHead("global_per_head_2") || trace.global_2,
-        value_label: "router_mass",
-        view_mode_label: "Mean Router",
+        value_label: "attention_mass",
+        view_mode_label: "Mean Attention",
       };
       getSourceLabels(trace).forEach((label) => {
         routerTrace[sourceBoardKey(label)] = (
@@ -1217,19 +1328,19 @@ HTML_PAGE = """<!DOCTYPE html>
       if (selectedHead != null && String(selectedHead) !== "all") {
         return {
           ...routerTrace,
-          view_mode_label: "Gate-Weighted Router",
-          value_label: "gate_weighted_router_mass",
+          view_mode_label: "Gate-Weighted Attention",
+          value_label: "gate_weighted_attention_mass",
         };
       }
       if (
-        (trace.router_mode || "shared") !== "per_head"
+        (trace.router_mode || "per_head") !== "per_head"
         || !Array.isArray(trace.aggregate_per_head_64)
         || !trace.aggregate_per_head_64.length
       ) {
         return {
           ...routerTrace,
-          view_mode_label: "Gate-Weighted Router",
-          value_label: "gate_weighted_router_mass",
+          view_mode_label: "Gate-Weighted Attention",
+          value_label: "gate_weighted_attention_mass",
         };
       }
 
@@ -1238,8 +1349,8 @@ HTML_PAGE = """<!DOCTYPE html>
         ...trace,
         aggregate_64: weightedAverageBoards(trace.aggregate_per_head_64, headWeights) || routerTrace.aggregate_64,
         global_2: weightedAverageBoards(trace.global_per_head_2, headWeights) || routerTrace.global_2,
-        view_mode_label: "Gate-Weighted Router",
-        value_label: "gate_weighted_router_mass",
+        view_mode_label: "Gate-Weighted Attention",
+        value_label: "gate_weighted_attention_mass",
       };
       getSourceLabels(trace).forEach((label) => {
         weightedTrace[sourceBoardKey(label)] = (
@@ -1306,9 +1417,9 @@ HTML_PAGE = """<!DOCTYPE html>
         return;
       }
 
-      const trace = session.layer_traces?.[String(selectedLayer)];
+      const trace = traceForSelectedLayer();
       if (!trace) {
-        boardsEl.innerHTML = `<div class="empty">No trace is available for layer ${selectedLayer} yet.</div>`;
+        boardsEl.innerHTML = `<div class="empty">No trace is available for ${selectedLayerLabel().toLowerCase()} yet.</div>`;
         metaEl.innerHTML = "";
         syncAggregationOptions(null);
         return;
@@ -1326,7 +1437,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const global = visibleTrace.global_2 || [0, 0];
       const effectiveHeadGates = Array.isArray(trace.effective_head_gates) ? trace.effective_head_gates : [];
       const tokenGateLogits = Array.isArray(trace.token_gate_logits) ? trace.token_gate_logits : [];
-      const routerMode = trace.router_mode || "shared";
+      const routerMode = trace.router_mode || "per_head";
       const headMeta = (
         selectedHead != null
         && String(selectedHead) !== "all"
@@ -1344,8 +1455,9 @@ HTML_PAGE = """<!DOCTYPE html>
         : 0;
 
       metaEl.innerHTML = `
+        <span><strong>Layer</strong> ${trace.layer_scope_label || selectedLayerLabel()}</span>
         <span><strong>Router</strong> ${routerMode}</span>
-        <span><strong>View</strong> ${visibleTrace.view_mode_label || "Mean Router"}</span>
+        <span><strong>View</strong> ${visibleTrace.view_mode_label || "Mean Attention"}</span>
         ${sourceMassEntries.map((entry) => `<span><strong>${entry.label}</strong> ${(entry.mass * 100).toFixed(1)}%</span>`).join("")}
         <span><strong>Global P</strong> ${(Number(global[0] || 0) * 100).toFixed(1)}%</span>
         <span><strong>Side</strong> ${(Number(global[1] || 0) * 100).toFixed(1)}%</span>

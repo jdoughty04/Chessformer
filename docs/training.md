@@ -92,7 +92,7 @@ Optional CUDA timing, torch profiler traces, memory snapshots, and MFU calculati
 
 - Checkpoints save every `save_steps` steps
 - Selective module loading via `load_checkpoint_*` flags lets you resume specific components
-- WandB logging tracks all losses, routing diagnostics, and validation generations
+- WandB logging tracks all losses, structured x-attn diagnostics, and validation generations
 
 ## Objectives and Loss Weights
 
@@ -106,22 +106,46 @@ All objective weights are configurable. Set weight to `0.0` to disable any head.
 | Move-eval regression | `move_eval_mse_weight` | Predict centipawn values |
 | BSR | `bsr_weight` | Reconstruct piece identity per square |
 | SPP | `spp_weight` | Predict attack counts and ray features |
-| Router sparsity | `structured_xattn_sparse_weight` | Keep decoder routing focused on few squares |
-| Router diversity | `structured_xattn_square_diversity_weight` | Prevent routing collapse to same squares |
-| Router gate usage | `structured_xattn_gate_usage_weight` | Keep token-conditioned chess injection from collapsing fully off |
+| Square sparsity | `structured_xattn_sparse_weight` | Keep active decoder square attention focused on few squares |
+| Square diversity | `structured_xattn_square_diversity_weight` | Prevent active square attention collapse to the same squares |
+| Gate usage | `structured_xattn_gate_usage_weight` | Keep token-conditioned chess injection from collapsing fully off |
 
-For structured fusion runs, the most important routing controls are usually:
+For structured fusion runs, the most important structured-attention controls are usually:
 
-- `xattn_structured_router_mode`: `shared` keeps one square router per token; `per_head` lets each x-attn head pick its own squares.
+- `xattn_structured_router_mode`: compatibility-only; `shared` is deprecated and is coerced to `per_head`, which is the only runtime behavior.
 - `xattn_text_gate_mode`: `tanh_head` adds a token-conditioned per-head gate on top of the learned static head gates.
-- `xattn_structured_use_engineered_source`: adds a fourth structured router source built from the `main` engineered square features.
+- `xattn_structured_use_engineered_source`: adds a fourth structured square-attention source built from the `main` engineered square features.
+- `engineered_only_xattn_ablation`: removes the backbone / CSMP / Perceiver path and trains structured x-attn against the engineered source alone.
 - `structured_xattn_gate_usage_target`: sets the minimum average `|effective_gate|` encouraged by the weak hinge loss.
 
-The current `main` engineered source is a `204`-dim per-square vector:
+The current `main` engineered source is a `205`-dim per-square vector:
 
 - `64` one-hot square identity
-- `12` piece-type/color occupancy
+- `13` piece-type/color occupancy, including an explicit empty-square channel
 - `64` attacked-target bitmask
 - `64` defended-friendly-target bitmask
 
 If you use it as a grounding aid, the most promising follow-up feature upgrades are usually attacker/defender counts, pin/check indicators, legal-move participation, ray-blocker features, pawn-structure features, and a small separate global engineered token.
+
+### Engineered-Only X-Attn Ablation
+
+Use this mode when you want the strongest grounding ablation: the LLM keeps its
+structured x-attn layers, but the chess adapter stack is otherwise removed.
+
+```yaml
+chess_fusion:
+  xattn_mode: structured_cross_attn
+  engineered_only_xattn_ablation: true
+```
+
+Behavior:
+
+- the only square source is `Engineered`
+- backbone / CSMP / Perceiver forwards are skipped
+- prepended latents are forcibly disabled
+- layer pseudotokens are still allowed by code, but they are static learned KV memory rather than board-conditioned context, so you should disable them for a clean ablation
+- adapter auxiliary heads and their losses must be disabled
+- `engineered_features` become required input for training and generation
+
+This is useful when you want to test whether the decoder-side structured attention and gates
+can learn grounded chess injection from hand-designed square features alone.

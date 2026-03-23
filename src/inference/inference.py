@@ -42,7 +42,7 @@ try:
     )
     from training.config import ModelConfig, LoRAConfig, HybridConfig, PerceiverConfig, ChessFusionConfig, load_config
     from training.lc0_extractor import LC0HiddenStateExtractor
-    from training.chess_adapter import extract_engineered_features
+    from training.chess_adapter import ENGINEERED_FEATURE_DIM, extract_engineered_features
     try:
         from training.perceiver_adapter import extract_perceiver_features
     except ImportError:
@@ -91,8 +91,8 @@ def detect_model_config(checkpoint_path: Path) -> ModelConfig:
     Logic:
     1. Try to load config.json (if we started saving it) - NOT YET IMPLEMENTED IN TRAIN
     2. Inspect adapter.pt state dict keys:
-       - 'mlp.0.weight' (input 204) -> Engineered
-       - 'mlp.0.weight' (input > 204) + 'layer_projections' -> Hybrid
+       - 'mlp.0.weight' (input 204 or 205) -> Engineered
+       - 'mlp.0.weight' (input > 205) + 'layer_projections' -> Hybrid
        - 'pos_embeddings' -> Legacy/LC0
        - 'perceiver' keys -> Perceiver
     """
@@ -116,7 +116,8 @@ def detect_model_config(checkpoint_path: Path) -> ModelConfig:
     # Defaults
     config = ModelConfig()
     
-    # 1a. Check for Chess-Fusion adapter (has multi_scale + gated_xattns + shared_readout)
+    # 1a. Check for Chess-Fusion adapter (has multi_scale + gated_xattns;
+    # shared_readout may also appear on legacy checkpoints)
     if any(k.startswith("multi_scale.") or k.startswith("gated_xattns.") or k.startswith("shared_readout.") for k in keys):
         print(" -> Detected: CHESS_FUSION mode")
         config.mode = "chess_fusion"
@@ -139,7 +140,7 @@ def detect_model_config(checkpoint_path: Path) -> ModelConfig:
     if "layer_projections.0.weight" in keys:
         if "mlp.0.weight" in keys:
              # Check MLP input dimension to be sure?
-             # Hybrid MLP input is 204 + (4 * lc0_proj_dim)
+             # Hybrid MLP input is 205 + (4 * lc0_proj_dim)
              # But existence of both projections and MLP strongly suggests hybrid
              # (Legacy 'full' mode also has projections+MLP but also 'pos_embeddings')
              if "pos_embeddings" not in keys:
@@ -167,11 +168,11 @@ def detect_model_config(checkpoint_path: Path) -> ModelConfig:
                  # If we detect legacy, we might fail. But let's assume valid formatted checkpoints for now.
                  pass
     
-    # 3. Check for Engineered (MLP only, no projections, input 204)
+    # 3. Check for Engineered (MLP only, no projections, legacy input 204 or current input 205)
     if "mlp.0.weight" in keys and "layer_projections.0.weight" not in keys:
         # Check input dimension of MLP
         weight = state_dict["mlp.0.weight"]
-        if weight.shape[1] == 204:
+        if weight.shape[1] in {204, ENGINEERED_FEATURE_DIM}:
             print(" -> Detected: ENGINEERED mode")
             config.mode = "engineered"
             return config
