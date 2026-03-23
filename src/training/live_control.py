@@ -42,6 +42,8 @@ DEFAULT_STATE = {
     "structured_xattn_sparse_weight": None,  # null = no change; float to apply
     "structured_xattn_square_diversity_weight": None,  # null = no change; float to apply
     "structured_xattn_square_diversity_target_entropy": None,  # null = no change; float to apply
+    "structured_xattn_gate_usage_weight": None,  # null = no change; float to apply
+    "structured_xattn_gate_usage_target": None,  # null = no change; float to apply
     "aux_move_eval_weight": None,  # null = no change; float to apply
     "move_eval_mse_weight": None,  # null = no change; float to apply
     "move_eval_ce_weight": None,   # null = no change; float to apply
@@ -94,6 +96,8 @@ DEFAULT_STATE = {
         "active_structured_xattn_sparse_weight": 0.0,
         "active_structured_xattn_square_diversity_weight": 0.0,
         "active_structured_xattn_square_diversity_target_entropy": 0.5,
+        "active_structured_xattn_gate_usage_weight": 0.0,
+        "active_structured_xattn_gate_usage_target": 0.1,
         "active_aux_move_eval_weight": 0.0,
         "active_move_eval_mse_weight": 0.5,
         "active_move_eval_ce_weight": 0.5,
@@ -213,6 +217,10 @@ button{padding:8px 16px;border-radius:6px;border:none;cursor:pointer;font-weight
 <input type="number" id="structured_xattn_square_diversity_weight" step="0.01" min="0" value="0">
 <label>Structured X-Attn Square Diversity Target Entropy</label>
 <input type="number" id="structured_xattn_square_diversity_target_entropy" step="0.01" min="0" max="1" value="0.5">
+<label>Structured X-Attn Gate Usage Weight</label>
+<input type="number" id="structured_xattn_gate_usage_weight" step="0.01" min="0" value="0">
+<label>Structured X-Attn Gate Usage Target</label>
+<input type="number" id="structured_xattn_gate_usage_target" step="0.01" min="0" max="1" value="0.1">
 <label>Move Eval Weight (outer)</label>
 <input type="number" id="aux_move_eval_weight" step="0.01" min="0" value="0">
 <label>Move Eval MSE Weight (inner)</label>
@@ -305,6 +313,10 @@ async function fetchState(){
       if(sxdw && d.status && d.status.active_structured_xattn_square_diversity_weight!==undefined) sxdw.value=d.status.active_structured_xattn_square_diversity_weight;
       const sxdt=document.getElementById('structured_xattn_square_diversity_target_entropy');
       if(sxdt && d.status && d.status.active_structured_xattn_square_diversity_target_entropy!==undefined) sxdt.value=d.status.active_structured_xattn_square_diversity_target_entropy;
+      const sxguw=document.getElementById('structured_xattn_gate_usage_weight');
+      if(sxguw && d.status && d.status.active_structured_xattn_gate_usage_weight!==undefined) sxguw.value=d.status.active_structured_xattn_gate_usage_weight;
+      const sxgut=document.getElementById('structured_xattn_gate_usage_target');
+      if(sxgut && d.status && d.status.active_structured_xattn_gate_usage_target!==undefined) sxgut.value=d.status.active_structured_xattn_gate_usage_target;
       const mew=document.getElementById('aux_move_eval_weight');
       if(mew && d.status && d.status.active_aux_move_eval_weight!==undefined) mew.value=d.status.active_aux_move_eval_weight;
       const mmw=document.getElementById('move_eval_mse_weight');
@@ -343,6 +355,8 @@ async function fetchState(){
       ['Structured X-Attn Sparse Weight',s.active_structured_xattn_sparse_weight],
       ['Structured X-Attn Square Diversity Weight',s.active_structured_xattn_square_diversity_weight],
       ['Structured X-Attn Square Diversity Target',s.active_structured_xattn_square_diversity_target_entropy],
+      ['Structured X-Attn Gate Usage Weight',s.active_structured_xattn_gate_usage_weight],
+      ['Structured X-Attn Gate Usage Target',s.active_structured_xattn_gate_usage_target],
       ['Move Eval Weight',s.active_aux_move_eval_weight],
       ['Move Eval MSE Weight',s.active_move_eval_mse_weight],
       ['Move Eval CE Weight',s.active_move_eval_ce_weight],
@@ -390,6 +404,8 @@ async function applyAuxWeights(){
   const sxw=parseFloat(document.getElementById('structured_xattn_sparse_weight').value);
   const sxdw=parseFloat(document.getElementById('structured_xattn_square_diversity_weight').value);
   const sxdt=parseFloat(document.getElementById('structured_xattn_square_diversity_target_entropy').value);
+  const sxguw=parseFloat(document.getElementById('structured_xattn_gate_usage_weight').value);
+  const sxgut=parseFloat(document.getElementById('structured_xattn_gate_usage_target').value);
   const mew=parseFloat(document.getElementById('aux_move_eval_weight').value);
   const mmw=parseFloat(document.getElementById('move_eval_mse_weight').value);
   const mcw=parseFloat(document.getElementById('move_eval_ce_weight').value);
@@ -401,6 +417,8 @@ async function applyAuxWeights(){
   if(!isNaN(sxw)&&sxw>=0) body.structured_xattn_sparse_weight=sxw;
   if(!isNaN(sxdw)&&sxdw>=0) body.structured_xattn_square_diversity_weight=sxdw;
   if(!isNaN(sxdt)&&sxdt>=0&&sxdt<=1) body.structured_xattn_square_diversity_target_entropy=sxdt;
+  if(!isNaN(sxguw)&&sxguw>=0) body.structured_xattn_gate_usage_weight=sxguw;
+  if(!isNaN(sxgut)&&sxgut>=0&&sxgut<=1) body.structured_xattn_gate_usage_target=sxgut;
   if(!isNaN(mew)&&mew>=0) body.aux_move_eval_weight=mew;
   if(!isNaN(mmw)&&mmw>=0) body.move_eval_mse_weight=mmw;
   if(!isNaN(mcw)&&mcw>=0) body.move_eval_ce_weight=mcw;
@@ -627,6 +645,8 @@ class TrainingController:
         state["structured_xattn_sparse_weight"] = None
         state["structured_xattn_square_diversity_weight"] = None
         state["structured_xattn_square_diversity_target_entropy"] = None
+        state["structured_xattn_gate_usage_weight"] = None
+        state["structured_xattn_gate_usage_target"] = None
         state["aux_move_eval_weight"] = None
         state["move_eval_mse_weight"] = None
         state["move_eval_ce_weight"] = None
@@ -642,6 +662,8 @@ class TrainingController:
             state["status"]["active_structured_xattn_sparse_weight"] = getattr(src, "structured_xattn_sparse_weight", 0.0)
             state["status"]["active_structured_xattn_square_diversity_weight"] = getattr(src, "structured_xattn_square_diversity_weight", 0.0)
             state["status"]["active_structured_xattn_square_diversity_target_entropy"] = getattr(src, "structured_xattn_square_diversity_target_entropy", 0.5)
+            state["status"]["active_structured_xattn_gate_usage_weight"] = getattr(src, "structured_xattn_gate_usage_weight", 0.0)
+            state["status"]["active_structured_xattn_gate_usage_target"] = getattr(src, "structured_xattn_gate_usage_target", 0.1)
             state["status"]["active_aux_move_eval_weight"] = getattr(src, "aux_move_eval_weight", 0.0)
             state["status"]["active_move_eval_mse_weight"] = getattr(src, "move_eval_mse_weight", 0.5)
             state["status"]["active_move_eval_ce_weight"] = getattr(src, "move_eval_ce_weight", 0.5)
@@ -708,6 +730,14 @@ class TrainingController:
             if state.get("structured_xattn_square_diversity_target_entropy") is not None:
                 changes["structured_xattn_square_diversity_target_entropy"] = state["structured_xattn_square_diversity_target_entropy"]
                 state["structured_xattn_square_diversity_target_entropy"] = None
+                need_write = True
+            if state.get("structured_xattn_gate_usage_weight") is not None:
+                changes["structured_xattn_gate_usage_weight"] = state["structured_xattn_gate_usage_weight"]
+                state["structured_xattn_gate_usage_weight"] = None
+                need_write = True
+            if state.get("structured_xattn_gate_usage_target") is not None:
+                changes["structured_xattn_gate_usage_target"] = state["structured_xattn_gate_usage_target"]
+                state["structured_xattn_gate_usage_target"] = None
                 need_write = True
 
             # Check for move-eval weight changes
@@ -786,6 +816,8 @@ class TrainingController:
                           or state.get("structured_xattn_sparse_weight") is not None
                           or state.get("structured_xattn_square_diversity_weight") is not None
                           or state.get("structured_xattn_square_diversity_target_entropy") is not None
+                          or state.get("structured_xattn_gate_usage_weight") is not None
+                          or state.get("structured_xattn_gate_usage_target") is not None
                           or state.get("aux_move_eval_weight") is not None
                           or state.get("move_eval_mse_weight") is not None
                           or state.get("move_eval_ce_weight") is not None
@@ -847,6 +879,10 @@ class TrainingController:
                             state["structured_xattn_square_diversity_weight"] = body["structured_xattn_square_diversity_weight"]
                         if "structured_xattn_square_diversity_target_entropy" in body:
                             state["structured_xattn_square_diversity_target_entropy"] = body["structured_xattn_square_diversity_target_entropy"]
+                        if "structured_xattn_gate_usage_weight" in body:
+                            state["structured_xattn_gate_usage_weight"] = body["structured_xattn_gate_usage_weight"]
+                        if "structured_xattn_gate_usage_target" in body:
+                            state["structured_xattn_gate_usage_target"] = body["structured_xattn_gate_usage_target"]
                         if "aux_move_eval_weight" in body:
                             state["aux_move_eval_weight"] = body["aux_move_eval_weight"]
                         if "move_eval_mse_weight" in body:

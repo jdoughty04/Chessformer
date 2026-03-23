@@ -43,22 +43,94 @@ class StubTokenizer:
         return " ".join(pieces)
 
 
-def make_trace(layer_idx: int, slot_index: int):
+def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_heads: int = 4):
     raw_slot_weights = torch.zeros(192, dtype=torch.float32)
     raw_slot_weights[slot_index] = 1.0
     source_square_weights = raw_slot_weights.view(3, 64)
-    return {
+    source_square_contribution_norms = source_square_weights * 0.8
+    trace = {
         layer_idx: {
             "raw_slot_weights": raw_slot_weights,
             "source_square_weights": source_square_weights,
             "aggregate_square_weights": source_square_weights.sum(dim=0),
             "global_weights": torch.tensor([0.75, 0.25], dtype=torch.float32),
+            "source_square_contribution_norms": source_square_contribution_norms,
+            "aggregate_square_contribution_norms": source_square_contribution_norms.sum(dim=0),
+            "global_contribution_norms": torch.tensor([0.12, 0.08], dtype=torch.float32),
             "last_token_index": torch.tensor(0, dtype=torch.long),
             "csmp_square_weights": source_square_weights[0].clone(),
             "perceiver_square_weights": source_square_weights[1].clone(),
             "policy_square_weights": source_square_weights[2].clone(),
+            "csmp_square_contribution_norms": source_square_contribution_norms[0].clone(),
+            "perceiver_square_contribution_norms": source_square_contribution_norms[1].clone(),
+            "policy_square_contribution_norms": source_square_contribution_norms[2].clone(),
+            "router_mode": "shared",
+            "effective_head_gates": torch.zeros(num_heads, dtype=torch.float32),
+            "token_gate_logits": torch.zeros(num_heads, dtype=torch.float32),
         }
     }
+    if per_head:
+        raw_slot_weights_per_head = torch.stack([raw_slot_weights.roll(shifts=h) for h in range(num_heads)], dim=0)
+        source_square_weights_per_head = raw_slot_weights_per_head.view(num_heads, 3, 64)
+        source_square_contribution_norms_per_head = []
+        global_contribution_norms_per_head = []
+        for head_idx in range(num_heads):
+            square_mass = 0.55 + 0.05 * head_idx
+            global_mass = 1.0 - square_mass
+            source_square_contribution_norms_per_head.append(
+                source_square_weights_per_head[head_idx] * square_mass
+            )
+            global_contribution_norms_per_head.append(
+                torch.tensor([global_mass * 0.6, global_mass * 0.4], dtype=torch.float32)
+            )
+        source_square_contribution_norms_per_head = torch.stack(
+            source_square_contribution_norms_per_head,
+            dim=0,
+        )
+        global_contribution_norms_per_head = torch.stack(global_contribution_norms_per_head, dim=0)
+        trace[layer_idx]["router_mode"] = "per_head"
+        trace[layer_idx]["raw_slot_weights_per_head"] = raw_slot_weights_per_head
+        trace[layer_idx]["source_square_weights_per_head"] = source_square_weights_per_head
+        trace[layer_idx]["aggregate_square_weights_per_head"] = source_square_weights_per_head.sum(dim=1)
+        trace[layer_idx]["global_weights_per_head"] = torch.full((num_heads, 2), 0.5, dtype=torch.float32)
+        trace[layer_idx]["source_square_contribution_norms_per_head"] = source_square_contribution_norms_per_head
+        trace[layer_idx]["aggregate_square_contribution_norms_per_head"] = (
+            source_square_contribution_norms_per_head.sum(dim=1)
+        )
+        trace[layer_idx]["global_contribution_norms_per_head"] = global_contribution_norms_per_head
+        trace[layer_idx]["raw_slot_weights"] = raw_slot_weights_per_head.mean(dim=0)
+        trace[layer_idx]["source_square_weights"] = source_square_weights_per_head.mean(dim=0)
+        trace[layer_idx]["aggregate_square_weights"] = trace[layer_idx]["aggregate_square_weights_per_head"].mean(dim=0)
+        trace[layer_idx]["global_weights"] = trace[layer_idx]["global_weights_per_head"].mean(dim=0)
+        trace[layer_idx]["source_square_contribution_norms"] = source_square_contribution_norms_per_head.mean(dim=0)
+        trace[layer_idx]["aggregate_square_contribution_norms"] = (
+            trace[layer_idx]["source_square_contribution_norms"].sum(dim=0)
+        )
+        trace[layer_idx]["global_contribution_norms"] = global_contribution_norms_per_head.mean(dim=0)
+        trace[layer_idx]["csmp_square_weights_per_head"] = source_square_weights_per_head[:, 0].clone()
+        trace[layer_idx]["perceiver_square_weights_per_head"] = source_square_weights_per_head[:, 1].clone()
+        trace[layer_idx]["policy_square_weights_per_head"] = source_square_weights_per_head[:, 2].clone()
+        trace[layer_idx]["csmp_square_contribution_norms_per_head"] = (
+            source_square_contribution_norms_per_head[:, 0].clone()
+        )
+        trace[layer_idx]["perceiver_square_contribution_norms_per_head"] = (
+            source_square_contribution_norms_per_head[:, 1].clone()
+        )
+        trace[layer_idx]["policy_square_contribution_norms_per_head"] = (
+            source_square_contribution_norms_per_head[:, 2].clone()
+        )
+        trace[layer_idx]["csmp_square_contribution_norms"] = (
+            trace[layer_idx]["source_square_contribution_norms"][0].clone()
+        )
+        trace[layer_idx]["perceiver_square_contribution_norms"] = (
+            trace[layer_idx]["source_square_contribution_norms"][1].clone()
+        )
+        trace[layer_idx]["policy_square_contribution_norms"] = (
+            trace[layer_idx]["source_square_contribution_norms"][2].clone()
+        )
+        trace[layer_idx]["effective_head_gates"] = torch.linspace(0.1, 0.4, steps=num_heads)
+        trace[layer_idx]["token_gate_logits"] = torch.linspace(-0.2, 0.1, steps=num_heads)
+    return trace
 
 
 class StubAdapter:
@@ -285,6 +357,34 @@ def test_decode_session_wraps_llm_calls_in_autocast_context():
     session.step()
 
     assert events == ["enter", "exit", "enter", "exit"]
+
+
+def test_decode_session_serializes_per_head_trace_metadata():
+    trace_sequence = [make_trace(7, 5, per_head=True)]
+    model = StubModel([[0.1, 0.4, 2.5, 0.3, -0.2, 0.0]], trace_sequence)
+    session = DecodeSession(model)
+
+    snapshot = session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+    trace = snapshot["layer_traces"]["7"]
+
+    assert trace["router_mode"] == "per_head"
+    assert len(trace["effective_head_gates"]) == 4
+    assert len(trace["token_gate_logits"]) == 4
+    assert len(trace["aggregate_per_head_64"]) == 4
+    assert len(trace["csmp_per_head_64"]) == 4
+    assert len(trace["perceiver_per_head_64"]) == 4
+    assert len(trace["policy_per_head_64"]) == 4
+    assert len(trace["global_per_head_2"]) == 4
+    assert len(trace["aggregate_contrib_64"]) == 64
+    assert len(trace["csmp_contrib_64"]) == 64
+    assert len(trace["perceiver_contrib_64"]) == 64
+    assert len(trace["policy_contrib_64"]) == 64
+    assert len(trace["global_contrib_2"]) == 2
+    assert len(trace["aggregate_contrib_per_head_64"]) == 4
+    assert len(trace["csmp_contrib_per_head_64"]) == 4
+    assert len(trace["perceiver_contrib_per_head_64"]) == 4
+    assert len(trace["policy_contrib_per_head_64"]) == 4
+    assert len(trace["global_contrib_per_head_2"]) == 4
 
 
 class FakeGenerateLLM:

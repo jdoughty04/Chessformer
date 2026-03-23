@@ -13,7 +13,7 @@ This module provides:
 import sys
 import math
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 import weakref
 
 import torch
@@ -2130,6 +2130,8 @@ class GatedCrossAttention(nn.Module):
         recurrent_query_use_mlp: bool = False,
         shared_recurrent_query_gru: Optional[nn.GRU] = None,
         xattn_mode: str = "recurrent_query_attn",
+        structured_router_mode: str = "shared",
+        text_gate_mode: str = "tanh_head",
     ):
         super().__init__()
         gate_init = float(gate_init)
@@ -2141,6 +2143,8 @@ class GatedCrossAttention(nn.Module):
         self.recurrent_query_state_dim = int(recurrent_query_state_dim)
         self.recurrent_query_use_mlp = bool(recurrent_query_use_mlp)
         self.xattn_mode = str(xattn_mode)
+        self.structured_router_mode = str(structured_router_mode)
+        self.text_gate_mode = str(text_gate_mode)
         self._shared_recurrent_query_gru_ref: Optional[weakref.ReferenceType] = None
         assert llm_dim % n_heads == 0, f"llm_dim {llm_dim} not divisible by n_heads {n_heads}"
         if self.xattn_mode not in {"recurrent_query_attn", "structured_square_mixer"}:
@@ -2148,6 +2152,18 @@ class GatedCrossAttention(nn.Module):
                 "xattn_mode must be one of "
                 "{'recurrent_query_attn', 'structured_square_mixer'} "
                 f"(got {self.xattn_mode!r})"
+            )
+        if self.structured_router_mode not in {"shared", "per_head"}:
+            raise ValueError(
+                "structured_router_mode must be one of "
+                "{'shared', 'per_head'} "
+                f"(got {self.structured_router_mode!r})"
+            )
+        if self.text_gate_mode not in {"none", "tanh_head"}:
+            raise ValueError(
+                "text_gate_mode must be one of "
+                "{'none', 'tanh_head'} "
+                f"(got {self.text_gate_mode!r})"
             )
 
         # --- Shared readout reference (set by ChessFusionAdapter) ---
@@ -2223,8 +2239,10 @@ class GatedCrossAttention(nn.Module):
             self.structured_policy_square_mlp = None
             self.structured_global_perceiver_mlp = None
             self.structured_global_side_mlp = None
+            self.structured_router_stem = None
             self.structured_square_weight_proj = None
             self.structured_global_weight_proj = None
+            self.text_gate_mlp = None
         else:
             self.recurrent_query_proj = None
             self.perc_kv_norm = None
@@ -2245,17 +2263,30 @@ class GatedCrossAttention(nn.Module):
             self.structured_policy_square_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
             self.structured_global_perceiver_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
             self.structured_global_side_mlp = self._build_source_value_mlp(self.context_dim, dropout)
-            self.structured_square_weight_proj = self._build_conditioning_head(
+            self.structured_router_stem = self._build_router_stem(
                 self.recurrent_query_state_dim + perceiver_dim,
-                64 * 3,
+                dropout,
             )
-            self.structured_global_weight_proj = self._build_recurrent_head(2)
+            square_router_dim = 64 * 3
+            global_router_dim = 2
+            if self.structured_router_mode == "per_head":
+                square_router_dim *= self.n_heads
+                global_router_dim *= self.n_heads
+            self.structured_square_weight_proj = nn.Linear(self.llm_dim, square_router_dim)
+            self.structured_global_weight_proj = nn.Linear(self.llm_dim, global_router_dim)
+            if self.text_gate_mode == "tanh_head":
+                self.text_gate_mlp = nn.Linear(self.llm_dim, self.n_heads)
+                nn.init.zeros_(self.text_gate_mlp.weight)
+                nn.init.zeros_(self.text_gate_mlp.bias)
+            else:
+                self.text_gate_mlp = None
 
         self._last_recurrent_query_state: Optional[torch.Tensor] = None
         self._last_source_weights: Optional[torch.Tensor] = None
         self._last_structured_metrics: Optional[Dict[str, torch.Tensor]] = None
         self._last_structured_square_sparse_loss: Optional[torch.Tensor] = None
         self._last_structured_square_usage_entropy_norm: Optional[torch.Tensor] = None
+        self._last_structured_gate_usage_mean_abs: Optional[torch.Tensor] = None
         self._capture_last_token_trace: bool = False
         self._last_token_trace: Optional[Dict[str, torch.Tensor]] = None
 
@@ -2296,6 +2327,14 @@ class GatedCrossAttention(nn.Module):
             nn.Linear(self.llm_dim, self.llm_dim),
         )
 
+    def _build_router_stem(self, input_dim: int, dropout: float) -> nn.Module:
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, self.llm_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
     @staticmethod
     def _require_rank3(name: str, tensor: torch.Tensor) -> None:
         if tensor.dim() != 3:
@@ -2332,6 +2371,23 @@ class GatedCrossAttention(nn.Module):
             raise RuntimeError("recurrent_query_gru is not initialized.")
         return self.recurrent_query_gru
 
+    def _reshape_values_to_heads(self, values: torch.Tensor) -> torch.Tensor:
+        batch_size, num_slots, _ = values.shape
+        return values.view(batch_size, num_slots, self.n_heads, self.head_dim)
+
+    def _compute_effective_structured_gate(
+        self,
+        valid: torch.Tensor,
+        token_gate_logits: Optional[torch.Tensor],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        static_gate_logits = self.gate.view(1, 1, self.n_heads)
+        if token_gate_logits is None:
+            effective_gate = torch.tanh(static_gate_logits).expand(valid.size(0), valid.size(1), -1)
+        else:
+            effective_gate = torch.tanh(static_gate_logits + token_gate_logits)
+        return effective_gate.to(dtype=dtype) * valid.unsqueeze(-1).to(dtype=dtype)
+
     def _source_cross_attn(
         self,
         q: torch.Tensor,
@@ -2363,6 +2419,8 @@ class GatedCrossAttention(nn.Module):
         self,
         slot_weights: torch.Tensor,
         global_weights: torch.Tensor,
+        token_gate_logits: Optional[torch.Tensor],
+        effective_gates: torch.Tensor,
         text_attention_mask: Optional[torch.Tensor],
     ) -> None:
         valid = self._build_valid_token_mask(
@@ -2374,39 +2432,122 @@ class GatedCrossAttention(nn.Module):
         valid_f = valid.to(dtype=slot_weights.dtype)
         denom = valid_f.sum().clamp(min=1.0)
 
-        slot_mean = (slot_weights * valid_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
-        slot_probs = slot_weights.clamp_min(1e-12)
-        slot_entropy = (-(slot_probs * slot_probs.log()).sum(dim=-1) * valid_f).sum() / denom
-        source_mass = slot_mean.view(3, 64).sum(dim=-1)
-        square_weights = slot_weights.view(slot_weights.size(0), slot_weights.size(1), 3, 64).sum(dim=2)
-        square_mean = (square_weights * valid_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
-        square_probs = square_weights.clamp_min(1e-12)
-        square_entropy = (-(square_probs * square_probs.log()).sum(dim=-1) * valid_f).sum() / denom
-        square_entropy_norm = square_entropy / max(math.log(float(square_weights.size(-1))), 1e-12)
-        square_mean_probs = square_mean.clamp_min(1e-12)
-        square_usage_entropy = -(square_mean_probs * square_mean_probs.log()).sum()
-        square_usage_entropy_norm = square_usage_entropy / max(math.log(float(square_mean.size(0))), 1e-12)
+        if slot_weights.dim() == 3:
+            slot_weights_per_head = slot_weights.unsqueeze(2)
+        elif slot_weights.dim() == 4:
+            slot_weights_per_head = slot_weights
+        else:
+            raise ValueError(
+                "Expected structured slot_weights rank 3 or 4, got "
+                f"{tuple(slot_weights.shape)}"
+            )
+
+        if global_weights.dim() == 3:
+            global_weights_per_head = global_weights.unsqueeze(2)
+        elif global_weights.dim() == 4:
+            global_weights_per_head = global_weights
+        else:
+            raise ValueError(
+                "Expected structured global_weights rank 3 or 4, got "
+                f"{tuple(global_weights.shape)}"
+            )
+
+        router_heads = int(slot_weights_per_head.size(2))
+        denom_per_head = denom * float(router_heads)
+
+        slot_mean_per_head = (
+            slot_weights_per_head * valid_f.unsqueeze(-1).unsqueeze(-1)
+        ).sum(dim=(0, 1)) / denom
+        slot_mean = slot_mean_per_head.mean(dim=0)
+        slot_probs = slot_weights_per_head.clamp_min(1e-12)
+        slot_entropy = (
+            -(slot_probs * slot_probs.log()).sum(dim=-1) * valid_f.unsqueeze(-1)
+        ).sum() / denom_per_head
+        source_mass_per_head = slot_mean_per_head.view(router_heads, 3, 64).sum(dim=-1)
+        source_mass = source_mass_per_head.mean(dim=0)
+
+        square_weights_per_head = slot_weights_per_head.view(
+            slot_weights_per_head.size(0),
+            slot_weights_per_head.size(1),
+            router_heads,
+            3,
+            64,
+        ).sum(dim=3)
+        square_mean_per_head = (
+            square_weights_per_head * valid_f.unsqueeze(-1).unsqueeze(-1)
+        ).sum(dim=(0, 1)) / denom
+        square_mean = square_mean_per_head.mean(dim=0)
+        square_probs = square_weights_per_head.clamp_min(1e-12)
+        square_entropy = (
+            -(square_probs * square_probs.log()).sum(dim=-1) * valid_f.unsqueeze(-1)
+        ).sum() / denom_per_head
+        square_entropy_norm = square_entropy / max(math.log(float(square_weights_per_head.size(-1))), 1e-12)
+        square_usage_entropy_per_head = -(
+            square_mean_per_head.clamp_min(1e-12) * square_mean_per_head.clamp_min(1e-12).log()
+        ).sum(dim=-1)
+        square_usage_entropy = square_usage_entropy_per_head.mean()
+        square_usage_entropy_norm = square_usage_entropy / max(
+            math.log(float(square_mean_per_head.size(-1))),
+            1e-12,
+        )
 
         max_slot_index = torch.argmax(slot_mean)
         max_slot_source_index = torch.div(max_slot_index, 64, rounding_mode="floor")
         max_slot_square_index = torch.remainder(max_slot_index, 64)
         max_square_index = torch.argmax(square_mean)
 
-        global_mean = (global_weights * valid_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
-        global_probs = global_weights.clamp_min(1e-12)
-        global_entropy = (-(global_probs * global_probs.log()).sum(dim=-1) * valid_f).sum() / denom
+        global_mean_per_head = (
+            global_weights_per_head * valid_f.unsqueeze(-1).unsqueeze(-1)
+        ).sum(dim=(0, 1)) / denom
+        global_mean = global_mean_per_head.mean(dim=0)
+        global_probs = global_weights_per_head.clamp_min(1e-12)
+        global_entropy = (
+            -(global_probs * global_probs.log()).sum(dim=-1) * valid_f.unsqueeze(-1)
+        ).sum() / denom_per_head
+
+        valid_gate_mask = valid.unsqueeze(-1).expand_as(effective_gates)
+        masked_effective_gates = effective_gates.masked_select(valid_gate_mask)
+        effective_gate_abs_mean_per_head = (
+            effective_gates.abs() * valid_f.unsqueeze(-1)
+        ).sum(dim=(0, 1)) / denom
+        if masked_effective_gates.numel() > 0:
+            effective_gate_abs_mean = masked_effective_gates.abs().mean()
+            effective_gate_std = masked_effective_gates.std(unbiased=False)
+        else:
+            zero = effective_gates.new_tensor(0.0)
+            effective_gate_abs_mean = zero
+            effective_gate_std = zero
+
+        if token_gate_logits is not None:
+            masked_token_gate_logits = token_gate_logits.masked_select(valid_gate_mask)
+            token_gate_logit_mean_per_head = (
+                token_gate_logits * valid_f.unsqueeze(-1)
+            ).sum(dim=(0, 1)) / denom
+            token_gate_logit_mean = (
+                masked_token_gate_logits.mean()
+                if masked_token_gate_logits.numel() > 0
+                else token_gate_logits.new_tensor(0.0)
+            )
+        else:
+            token_gate_logit_mean_per_head = effective_gates.new_zeros(self.n_heads)
+            token_gate_logit_mean = effective_gates.new_tensor(0.0)
 
         self._last_structured_square_sparse_loss = square_entropy_norm
         self._last_structured_square_usage_entropy_norm = square_usage_entropy_norm
+        self._last_structured_gate_usage_mean_abs = effective_gate_abs_mean
         self._last_structured_metrics = {
+            "router_mode": self.structured_router_mode,
             "slot_mean": slot_mean.detach(),
+            "slot_mean_per_head": slot_mean_per_head.detach(),
             "slot_entropy": slot_entropy.detach(),
             "source_mass": source_mass.detach(),
+            "source_mass_per_head": source_mass_per_head.detach(),
             "max_slot_index": max_slot_index.detach(),
             "max_slot_source_index": max_slot_source_index.detach(),
             "max_slot_square_index": max_slot_square_index.detach(),
             "max_slot_mass": slot_mean[max_slot_index].detach(),
             "square_mean": square_mean.detach(),
+            "square_mean_per_head": square_mean_per_head.detach(),
             "square_entropy": square_entropy.detach(),
             "square_entropy_norm": square_entropy_norm.detach(),
             "square_usage_entropy": square_usage_entropy.detach(),
@@ -2414,20 +2555,31 @@ class GatedCrossAttention(nn.Module):
             "max_square_index": max_square_index.detach(),
             "max_square_mass": square_mean[max_square_index].detach(),
             "global_mean": global_mean.detach(),
+            "global_mean_per_head": global_mean_per_head.detach(),
             "global_entropy": global_entropy.detach(),
+            "effective_gate_abs_mean": effective_gate_abs_mean.detach(),
+            "effective_gate_abs_mean_per_head": effective_gate_abs_mean_per_head.detach(),
+            "effective_gate_std": effective_gate_std.detach(),
+            "token_gate_logit_mean": token_gate_logit_mean.detach(),
+            "token_gate_logit_mean_per_head": token_gate_logit_mean_per_head.detach(),
         }
 
     def _cache_last_token_trace(
         self,
         slot_weights: torch.Tensor,
         global_weights: torch.Tensor,
+        token_gate_logits: Optional[torch.Tensor],
+        effective_gates: torch.Tensor,
         text_attention_mask: Optional[torch.Tensor],
+        square_values_heads: torch.Tensor,
+        global_values_heads: torch.Tensor,
     ) -> None:
         if not self._capture_last_token_trace:
             self._last_token_trace = None
             return
 
-        batch_size, seq_len, _ = slot_weights.shape
+        batch_size = int(slot_weights.size(0))
+        seq_len = int(slot_weights.size(1))
         if seq_len <= 0:
             self._last_token_trace = None
             return
@@ -2441,19 +2593,145 @@ class GatedCrossAttention(nn.Module):
         valid_counts = valid.long().sum(dim=1)
         last_token_indices = (valid_counts - 1).clamp(min=0, max=seq_len - 1)
         batch_indices = torch.arange(batch_size, device=slot_weights.device)
+        selected_effective_gates = effective_gates[batch_indices, last_token_indices].detach()
+        selected_token_gate_logits = None
+        if token_gate_logits is not None:
+            selected_token_gate_logits = token_gate_logits[batch_indices, last_token_indices].detach()
 
-        raw_slot_weights = slot_weights[batch_indices, last_token_indices].detach()
-        global_token_weights = global_weights[batch_indices, last_token_indices].detach()
-        source_square_weights = raw_slot_weights.view(batch_size, 3, 64)
-        aggregate_square_weights = source_square_weights.sum(dim=1)
-
-        self._last_token_trace = {
-            "raw_slot_weights": raw_slot_weights,
-            "source_square_weights": source_square_weights,
-            "aggregate_square_weights": aggregate_square_weights,
-            "global_weights": global_token_weights,
+        trace: Dict[str, Any] = {
+            "router_mode": self.structured_router_mode,
+            "effective_head_gates": selected_effective_gates,
             "last_token_indices": last_token_indices.detach(),
         }
+        if selected_token_gate_logits is not None:
+            trace["token_gate_logits"] = selected_token_gate_logits
+
+        o_proj_weight = self.o_proj.weight.detach().float().view(self.llm_dim, self.n_heads, self.head_dim)
+        square_values_projected = torch.einsum(
+            "bnhd,ohd->bnho",
+            square_values_heads.detach().float(),
+            o_proj_weight,
+        ).permute(0, 2, 1, 3)
+        global_values_projected = torch.einsum(
+            "bghd,ohd->bgho",
+            global_values_heads.detach().float(),
+            o_proj_weight,
+        ).permute(0, 2, 1, 3)
+
+        if slot_weights.dim() == 3:
+            raw_slot_weights = slot_weights[batch_indices, last_token_indices].detach()
+            global_token_weights = global_weights[batch_indices, last_token_indices].detach()
+            source_square_weights = raw_slot_weights.view(batch_size, 3, 64)
+            aggregate_square_weights = source_square_weights.sum(dim=1)
+            head_square_weights = raw_slot_weights.unsqueeze(1).expand(-1, self.n_heads, -1)
+            head_global_weights = global_token_weights.unsqueeze(1).expand(-1, self.n_heads, -1)
+            trace.update(
+                {
+                    "raw_slot_weights": raw_slot_weights,
+                    "source_square_weights": source_square_weights,
+                    "aggregate_square_weights": aggregate_square_weights,
+                    "global_weights": global_token_weights,
+                }
+            )
+        else:
+            raw_slot_weights_per_head = slot_weights[batch_indices, last_token_indices].detach()
+            global_weights_per_head = global_weights[batch_indices, last_token_indices].detach()
+            source_square_weights_per_head = raw_slot_weights_per_head.view(batch_size, self.n_heads, 3, 64)
+            aggregate_square_weights_per_head = source_square_weights_per_head.sum(dim=2)
+            head_square_weights = raw_slot_weights_per_head
+            head_global_weights = global_weights_per_head
+            trace.update(
+                {
+                    "raw_slot_weights": raw_slot_weights_per_head.mean(dim=1),
+                    "source_square_weights": source_square_weights_per_head.mean(dim=1),
+                    "aggregate_square_weights": aggregate_square_weights_per_head.mean(dim=1),
+                    "global_weights": global_weights_per_head.mean(dim=1),
+                    "raw_slot_weights_per_head": raw_slot_weights_per_head,
+                    "source_square_weights_per_head": source_square_weights_per_head,
+                    "aggregate_square_weights_per_head": aggregate_square_weights_per_head,
+                    "global_weights_per_head": global_weights_per_head,
+                }
+            )
+
+        selected_effective_gates_f = selected_effective_gates.detach().float()
+        head_square_weights_f = head_square_weights.detach().float()
+        head_global_weights_f = head_global_weights.detach().float()
+        gate_scale = selected_effective_gates_f.unsqueeze(-1).unsqueeze(-1)
+
+        square_contrib_vectors_per_head = (
+            gate_scale
+            * head_square_weights_f.unsqueeze(-1)
+            * square_values_projected[batch_indices]
+        ).view(batch_size, self.n_heads, 3, 64, self.llm_dim)
+        global_contrib_vectors_per_head = (
+            gate_scale
+            * head_global_weights_f.unsqueeze(-1)
+            * global_values_projected[batch_indices]
+        )
+
+        source_square_contribution_norms_per_head = square_contrib_vectors_per_head.norm(dim=-1)
+        aggregate_square_contribution_norms_per_head = source_square_contribution_norms_per_head.sum(dim=2)
+        global_contribution_norms_per_head = global_contrib_vectors_per_head.norm(dim=-1)
+
+        source_square_contribution_vectors = square_contrib_vectors_per_head.sum(dim=1)
+        global_contribution_vectors = global_contrib_vectors_per_head.sum(dim=1)
+        source_square_contribution_norms = source_square_contribution_vectors.norm(dim=-1)
+        aggregate_square_contribution_norms = source_square_contribution_norms.sum(dim=1)
+        global_contribution_norms = global_contribution_vectors.norm(dim=-1)
+
+        contribution_total = (
+            source_square_contribution_norms.sum(dim=(1, 2))
+            + global_contribution_norms.sum(dim=-1)
+        ).clamp_min(1e-12)
+        source_square_contribution_norms = (
+            source_square_contribution_norms
+            / contribution_total.view(batch_size, 1, 1)
+        )
+        aggregate_square_contribution_norms = source_square_contribution_norms.sum(dim=1)
+        global_contribution_norms = (
+            global_contribution_norms
+            / contribution_total.view(batch_size, 1)
+        )
+
+        per_head_contribution_total = (
+            source_square_contribution_norms_per_head.sum(dim=(2, 3))
+            + global_contribution_norms_per_head.sum(dim=-1)
+        ).clamp_min(1e-12)
+        source_square_contribution_norms_per_head = (
+            source_square_contribution_norms_per_head
+            / per_head_contribution_total.unsqueeze(-1).unsqueeze(-1)
+        )
+        aggregate_square_contribution_norms_per_head = (
+            source_square_contribution_norms_per_head.sum(dim=2)
+        )
+        global_contribution_norms_per_head = (
+            global_contribution_norms_per_head
+            / per_head_contribution_total.unsqueeze(-1)
+        )
+
+        trace.update(
+            {
+                "source_square_contribution_norms": source_square_contribution_norms.detach(),
+                "aggregate_square_contribution_norms": aggregate_square_contribution_norms.detach(),
+                "global_contribution_norms": global_contribution_norms.detach(),
+            }
+        )
+        if self.structured_router_mode == "per_head":
+            trace.update(
+                {
+                    "source_square_contribution_norms_per_head": (
+                        source_square_contribution_norms_per_head.detach()
+                    ),
+                    "aggregate_square_contribution_norms_per_head": (
+                        aggregate_square_contribution_norms_per_head.detach()
+                    ),
+                    "global_contribution_norms_per_head": (
+                        global_contribution_norms_per_head.detach()
+                    ),
+                }
+            )
+
+        self._last_token_trace = trace
 
     def _forward_recurrent_query_mode(
         self,
@@ -2546,12 +2824,17 @@ class GatedCrossAttention(nn.Module):
         text_attention_mask: Optional[torch.Tensor],
         policy_latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.structured_square_weight_proj is None or self.structured_global_weight_proj is None:
+        if (
+            self.structured_router_stem is None
+            or self.structured_square_weight_proj is None
+            or self.structured_global_weight_proj is None
+        ):
             raise RuntimeError("structured_square_mixer mode is not initialized on this layer.")
 
         self._last_structured_metrics = None
         self._last_structured_square_sparse_loss = None
         self._last_structured_square_usage_entropy_norm = None
+        self._last_structured_gate_usage_mean_abs = None
         self._last_token_trace = None
         self._require_rank3("perceiver_latents", perceiver_latents)
         if perceiver_latents.size(1) < 65:
@@ -2584,11 +2867,15 @@ class GatedCrossAttention(nn.Module):
 
         global_perceiver_latent = perceiver_latents[:, 64, :]
         global_perceiver_cond = global_perceiver_latent.unsqueeze(1).expand(-1, S, -1)
-        # Let each text token score the 64 x 3 aligned square slots with access to
-        # the shared board-level Perceiver summary as additional conditioning.
-        square_weight_inputs = torch.cat([rq_state, global_perceiver_cond], dim=-1)
-        square_logits = self.structured_square_weight_proj(square_weight_inputs)
-        square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
+        router_inputs = torch.cat([rq_state, global_perceiver_cond], dim=-1)
+        router_hidden = self.structured_router_stem(router_inputs)
+        square_logits = self.structured_square_weight_proj(router_hidden)
+        global_logits = self.structured_global_weight_proj(router_hidden)
+        token_gate_logits: Optional[torch.Tensor]
+        if self.text_gate_mlp is not None:
+            token_gate_logits = self.text_gate_mlp(router_hidden)
+        else:
+            token_gate_logits = None
 
         square_values = torch.cat(
             [
@@ -2598,7 +2885,7 @@ class GatedCrossAttention(nn.Module):
             ],
             dim=1,
         )  # (B, 192, llm_dim)
-        square_mix = torch.einsum("bsn,bnd->bsd", square_weights, square_values)
+        square_values_heads = self._reshape_values_to_heads(square_values)
 
         global_values = torch.stack(
             [
@@ -2607,24 +2894,53 @@ class GatedCrossAttention(nn.Module):
             ],
             dim=1,
         )  # (B, 2, llm_dim)
-        global_logits = self.structured_global_weight_proj(rq_state)
-        global_weights = torch.softmax(global_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
-        global_mix = torch.einsum("bsg,bgd->bsd", global_weights, global_values)
+        global_values_heads = self._reshape_values_to_heads(global_values)
+
+        if self.structured_router_mode == "per_head":
+            square_logits = square_logits.view(B, S, self.n_heads, 64 * 3)
+            square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
+            square_mix = torch.einsum("bshn,bnhd->bshd", square_weights, square_values_heads)
+
+            global_logits = global_logits.view(B, S, self.n_heads, 2)
+            global_weights = torch.softmax(global_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
+            global_mix = torch.einsum("bshg,bghd->bshd", global_weights, global_values_heads)
+        else:
+            square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
+            square_mix = torch.einsum("bsn,bnhd->bshd", square_weights, square_values_heads)
+
+            global_weights = torch.softmax(global_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
+            global_mix = torch.einsum("bsg,bghd->bshd", global_weights, global_values_heads)
+
+        effective_gates = self._compute_effective_structured_gate(
+            valid=valid,
+            token_gate_logits=token_gate_logits,
+            dtype=hidden_states.dtype,
+        )
+        self._last_text_gate = (
+            token_gate_logits.detach()
+            if token_gate_logits is not None
+            else None
+        )
 
         self._cache_structured_metrics(
             slot_weights=square_weights.float(),
             global_weights=global_weights.float(),
+            token_gate_logits=token_gate_logits.float() if token_gate_logits is not None else None,
+            effective_gates=effective_gates.float(),
             text_attention_mask=text_attention_mask,
         )
         self._cache_last_token_trace(
             slot_weights=square_weights.float(),
             global_weights=global_weights.float(),
+            token_gate_logits=token_gate_logits.float() if token_gate_logits is not None else None,
+            effective_gates=effective_gates.float(),
             text_attention_mask=text_attention_mask,
+            square_values_heads=square_values_heads,
+            global_values_heads=global_values_heads,
         )
 
-        attn_out = (square_mix + global_mix).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        attn_out = torch.tanh(self.gate) * attn_out
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.llm_dim)
+        attn_out = (square_mix + global_mix) * effective_gates.unsqueeze(-1)
+        attn_out = attn_out.contiguous().view(B, S, self.llm_dim)
         attn_out = self.o_proj(attn_out)
         hidden_states = hidden_states + attn_out
 
@@ -2666,6 +2982,8 @@ class GatedCrossAttention(nn.Module):
         self._last_structured_metrics = None
         self._last_structured_square_sparse_loss = None
         self._last_structured_square_usage_entropy_norm = None
+        self._last_structured_gate_usage_mean_abs = None
+        self._last_text_gate = None
         return self._forward_recurrent_query_mode(
             hidden_states=hidden_states,
             perceiver_latents=perceiver_latents,
@@ -3091,6 +3409,8 @@ class ChessFusionAdapter(nn.Module):
         self.enable_lm_pseudotokens = bool(getattr(cfg, 'enable_lm_pseudotokens', True))
         self.num_lm_pseudotokens = int(getattr(cfg, 'num_lm_pseudotokens', 0)) if self.enable_lm_pseudotokens else 0
         self.xattn_mode = str(getattr(cfg, 'xattn_mode', 'recurrent_query_attn'))
+        self.xattn_structured_router_mode = str(getattr(cfg, 'xattn_structured_router_mode', 'shared'))
+        self.xattn_text_gate_mode = str(getattr(cfg, 'xattn_text_gate_mode', 'tanh_head'))
         self.xattn_recurrent_query_share_gru_across_layers = bool(
             getattr(cfg, 'xattn_recurrent_query_share_gru_across_layers', False)
         )
@@ -3152,6 +3472,18 @@ class ChessFusionAdapter(nn.Module):
                 "chess_fusion.xattn_mode must be one of "
                 "{'recurrent_query_attn', 'structured_square_mixer'} "
                 f"(got {self.xattn_mode!r})"
+            )
+        if self.xattn_structured_router_mode not in {'shared', 'per_head'}:
+            raise ValueError(
+                "chess_fusion.xattn_structured_router_mode must be one of "
+                "{'shared', 'per_head'} "
+                f"(got {self.xattn_structured_router_mode!r})"
+            )
+        if self.xattn_text_gate_mode not in {'none', 'tanh_head'}:
+            raise ValueError(
+                "chess_fusion.xattn_text_gate_mode must be one of "
+                "{'none', 'tanh_head'} "
+                f"(got {self.xattn_text_gate_mode!r})"
             )
         if self.xattn_mode == 'structured_square_mixer':
             if not self.structured_latents:
@@ -3327,6 +3659,8 @@ class ChessFusionAdapter(nn.Module):
                 recurrent_query_use_mlp=bool(getattr(cfg, 'xattn_recurrent_query_use_mlp', False)),
                 shared_recurrent_query_gru=self.shared_recurrent_query_gru,
                 xattn_mode=self.xattn_mode,
+                structured_router_mode=self.xattn_structured_router_mode,
+                text_gate_mode=self.xattn_text_gate_mode,
             )
             for _ in self.xattn_layer_indices
         ])
@@ -3407,6 +3741,11 @@ class ChessFusionAdapter(nn.Module):
         print(f"  Objective policy teacher: {self.teacher_backbone is not None}")
         print(f"  Perceiver: {self.cfg.num_latents} latents x {self.cfg.perceiver_depth} layers")
         print(f"  XAttn mode: {self.xattn_mode}")
+        if self.xattn_mode == "structured_square_mixer":
+            print(
+                f"  Structured router: mode={self.xattn_structured_router_mode}, "
+                f"text_gate_mode={self.xattn_text_gate_mode}"
+            )
         if self.shared_readout is not None:
             print(f"  Fusion tokens: {self.cfg.num_fusion_tokens} per xattn layer (policy_latent_cond={bool(getattr(self.cfg, 'readout_use_policy_latent_cross_attention', False))})")
         else:
@@ -3784,10 +4123,19 @@ class ChessFusionAdapter(nn.Module):
                 continue
 
             slot_mean = structured["slot_mean"].detach().float().cpu()
+            slot_mean_per_head = structured["slot_mean_per_head"].detach().float().cpu()
             square_mean = structured["square_mean"].detach().float().cpu()
+            square_mean_per_head = structured["square_mean_per_head"].detach().float().cpu()
             source_mass = structured["source_mass"].detach().float().cpu()
+            source_mass_per_head = structured["source_mass_per_head"].detach().float().cpu()
             global_mean = structured["global_mean"].detach().float().cpu()
+            global_mean_per_head = structured["global_mean_per_head"].detach().float().cpu()
+            effective_gate_abs_mean_per_head = structured["effective_gate_abs_mean_per_head"].detach().float().cpu()
+            token_gate_logit_mean_per_head = structured["token_gate_logit_mean_per_head"].detach().float().cpu()
 
+            metrics[f"structured_xattn/layer_{idx}/router_is_per_head"] = float(
+                structured["router_mode"] == "per_head"
+            )
             metrics[f"structured_xattn/layer_{idx}/slot_entropy"] = structured["slot_entropy"].item()
             metrics[f"structured_xattn/layer_{idx}/max_slot_mass"] = structured["max_slot_mass"].item()
             metrics[f"structured_xattn/layer_{idx}/max_slot_index"] = structured["max_slot_index"].item()
@@ -3800,6 +4148,9 @@ class ChessFusionAdapter(nn.Module):
             metrics[f"structured_xattn/layer_{idx}/max_square_mass"] = structured["max_square_mass"].item()
             metrics[f"structured_xattn/layer_{idx}/max_square_index"] = structured["max_square_index"].item()
             metrics[f"structured_xattn/layer_{idx}/global_entropy"] = structured["global_entropy"].item()
+            metrics[f"structured_xattn/layer_{idx}/effective_gate_abs_mean"] = structured["effective_gate_abs_mean"].item()
+            metrics[f"structured_xattn/layer_{idx}/effective_gate_std"] = structured["effective_gate_std"].item()
+            metrics[f"structured_xattn/layer_{idx}/token_gate_logit_mean"] = structured["token_gate_logit_mean"].item()
             metrics[f"structured_xattn/layer_{idx}/slot_mean_mean"] = slot_mean.mean().item()
             metrics[f"structured_xattn/layer_{idx}/slot_mean_std"] = slot_mean.std(unbiased=False).item()
             metrics[f"structured_xattn/layer_{idx}/slot_mean_min"] = slot_mean.min().item()
@@ -3830,6 +4181,26 @@ class ChessFusionAdapter(nn.Module):
                 metrics[f"structured_xattn/layer_{idx}/{source_name}/slot_min_square_index"] = float(source_slot_min_index)
                 metrics[f"structured_xattn/layer_{idx}/{source_name}/slot_max_square_index"] = float(source_slot_max_index)
 
+            for head_idx in range(int(slot_mean_per_head.size(0))):
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/slot_mean_std"] = (
+                    slot_mean_per_head[head_idx].std(unbiased=False).item()
+                )
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/square_mean_std"] = (
+                    square_mean_per_head[head_idx].std(unbiased=False).item()
+                )
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/effective_gate_abs_mean"] = (
+                    effective_gate_abs_mean_per_head[head_idx].item()
+                )
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/token_gate_logit_mean"] = (
+                    token_gate_logit_mean_per_head[head_idx].item()
+                )
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/source_mass_mean"] = (
+                    source_mass_per_head[head_idx].mean().item()
+                )
+                metrics[f"structured_xattn/layer_{idx}/head_{head_idx}/global_mass_mean"] = (
+                    global_mean_per_head[head_idx].mean().item()
+                )
+
             for global_idx, global_name in enumerate(global_source_names):
                 metrics[f"structured_xattn/layer_{idx}/global_mass/{global_name}"] = global_mean[global_idx].item()
 
@@ -3839,8 +4210,8 @@ class ChessFusionAdapter(nn.Module):
     def get_last_token_structured_traces(
         self,
         sample_index: int = 0,
-    ) -> Dict[int, Dict[str, torch.Tensor]]:
-        traces: Dict[int, Dict[str, torch.Tensor]] = {}
+    ) -> Dict[int, Dict[str, Any]]:
+        traces: Dict[int, Dict[str, Any]] = {}
 
         for i, idx in enumerate(self.xattn_layer_indices):
             xattn = self.gated_xattns[i]
@@ -3857,7 +4228,7 @@ class ChessFusionAdapter(nn.Module):
             source_square_weights = (
                 trace["source_square_weights"][sample_index].detach().float().cpu()
             )
-            traces[idx] = {
+            trace_dict: Dict[str, Any] = {
                 "raw_slot_weights": trace["raw_slot_weights"][sample_index].detach().float().cpu(),
                 "source_square_weights": source_square_weights,
                 "aggregate_square_weights": (
@@ -3869,6 +4240,67 @@ class ChessFusionAdapter(nn.Module):
                 "perceiver_square_weights": source_square_weights[1].clone(),
                 "policy_square_weights": source_square_weights[2].clone(),
             }
+            if "effective_head_gates" in trace:
+                trace_dict["effective_head_gates"] = (
+                    trace["effective_head_gates"][sample_index].detach().float().cpu()
+                )
+            if "token_gate_logits" in trace:
+                trace_dict["token_gate_logits"] = (
+                    trace["token_gate_logits"][sample_index].detach().float().cpu()
+                )
+            if "source_square_contribution_norms" in trace:
+                contribution_norms = (
+                    trace["source_square_contribution_norms"][sample_index].detach().float().cpu()
+                )
+                trace_dict["source_square_contribution_norms"] = contribution_norms
+                trace_dict["aggregate_square_contribution_norms"] = (
+                    trace["aggregate_square_contribution_norms"][sample_index].detach().float().cpu()
+                )
+                trace_dict["global_contribution_norms"] = (
+                    trace["global_contribution_norms"][sample_index].detach().float().cpu()
+                )
+                trace_dict["csmp_square_contribution_norms"] = contribution_norms[0].clone()
+                trace_dict["perceiver_square_contribution_norms"] = contribution_norms[1].clone()
+                trace_dict["policy_square_contribution_norms"] = contribution_norms[2].clone()
+            if "raw_slot_weights_per_head" in trace:
+                per_head_source_square_weights = (
+                    trace["source_square_weights_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["raw_slot_weights_per_head"] = (
+                    trace["raw_slot_weights_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["source_square_weights_per_head"] = per_head_source_square_weights
+                trace_dict["aggregate_square_weights_per_head"] = (
+                    trace["aggregate_square_weights_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["global_weights_per_head"] = (
+                    trace["global_weights_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["csmp_square_weights_per_head"] = per_head_source_square_weights[:, 0].clone()
+                trace_dict["perceiver_square_weights_per_head"] = per_head_source_square_weights[:, 1].clone()
+                trace_dict["policy_square_weights_per_head"] = per_head_source_square_weights[:, 2].clone()
+            if "source_square_contribution_norms_per_head" in trace:
+                per_head_contribution_norms = (
+                    trace["source_square_contribution_norms_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["source_square_contribution_norms_per_head"] = per_head_contribution_norms
+                trace_dict["aggregate_square_contribution_norms_per_head"] = (
+                    trace["aggregate_square_contribution_norms_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["global_contribution_norms_per_head"] = (
+                    trace["global_contribution_norms_per_head"][sample_index].detach().float().cpu()
+                )
+                trace_dict["csmp_square_contribution_norms_per_head"] = (
+                    per_head_contribution_norms[:, 0].clone()
+                )
+                trace_dict["perceiver_square_contribution_norms_per_head"] = (
+                    per_head_contribution_norms[:, 1].clone()
+                )
+                trace_dict["policy_square_contribution_norms_per_head"] = (
+                    per_head_contribution_norms[:, 2].clone()
+                )
+            trace_dict["router_mode"] = trace["router_mode"]
+            traces[idx] = trace_dict
 
         return traces
 
@@ -3903,6 +4335,28 @@ class ChessFusionAdapter(nn.Module):
             losses.append(F.relu(target - usage_entropy))
         if losses:
             return torch.stack(losses).mean(), torch.stack(entropies).mean()
+        zero = torch.tensor(0.0, device=device)
+        return zero, zero
+
+    def compute_structured_xattn_gate_usage_loss(
+        self,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        losses: List[torch.Tensor] = []
+        usages: List[torch.Tensor] = []
+        target_usage = float(getattr(self.cfg, "structured_xattn_gate_usage_target", 0.1))
+        target_usage = min(max(target_usage, 0.0), 1.0)
+        for xattn in self.gated_xattns:
+            if xattn.xattn_mode != "structured_square_mixer":
+                continue
+            usage = getattr(xattn, "_last_structured_gate_usage_mean_abs", None)
+            if usage is None:
+                continue
+            target = usage.new_tensor(target_usage)
+            usages.append(usage)
+            losses.append(F.relu(target - usage))
+        if losses:
+            return torch.stack(losses).mean(), torch.stack(usages).mean()
         zero = torch.tensor(0.0, device=device)
         return zero, zero
 
@@ -4139,7 +4593,9 @@ class ChessFusionAdapter(nn.Module):
             'move_eval_loss', 'move_eval_mse', 'move_eval_ce', 'move_eval_pairwise',
             'move_eval_mate', 'structured_xattn_sparse_loss',
             'structured_xattn_square_diversity_loss',
-            'structured_xattn_square_usage_entropy', 'total_aux_loss'
+            'structured_xattn_square_usage_entropy',
+            'structured_xattn_gate_usage_loss',
+            'structured_xattn_gate_usage_mean_abs', 'total_aux_loss'
         """
         losses = {}
 
@@ -4350,6 +4806,21 @@ class ChessFusionAdapter(nn.Module):
         else:
             losses['structured_xattn_square_diversity_loss'] = torch.tensor(0.0, device=policy_logits.device)
             losses['structured_xattn_square_usage_entropy'] = torch.tensor(0.0, device=policy_logits.device)
+        structured_xattn_gate_usage_weight = getattr(
+            self.cfg,
+            'structured_xattn_gate_usage_weight',
+            0.0,
+        )
+        if structured_xattn_gate_usage_weight > 0:
+            (
+                losses['structured_xattn_gate_usage_loss'],
+                losses['structured_xattn_gate_usage_mean_abs'],
+            ) = self.compute_structured_xattn_gate_usage_loss(
+                device=policy_logits.device,
+            )
+        else:
+            losses['structured_xattn_gate_usage_loss'] = torch.tensor(0.0, device=policy_logits.device)
+            losses['structured_xattn_gate_usage_mean_abs'] = torch.tensor(0.0, device=policy_logits.device)
 
         losses['total_aux_loss'] = (
             self.cfg.aux_policy_weight * losses['policy_loss']
@@ -4359,6 +4830,7 @@ class ChessFusionAdapter(nn.Module):
             + move_eval_weight * losses['move_eval_loss']
             + structured_xattn_sparse_weight * losses['structured_xattn_sparse_loss']
             + structured_xattn_square_diversity_weight * losses['structured_xattn_square_diversity_loss']
+            + structured_xattn_gate_usage_weight * losses['structured_xattn_gate_usage_loss']
         )
 
         return losses

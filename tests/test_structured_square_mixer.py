@@ -1,4 +1,5 @@
 import copy
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -268,14 +269,23 @@ def test_structured_square_mixer_metrics_have_expected_shapes_and_normalization(
     assert outputs.shape == inputs["hidden_states"].shape
     metrics = xattn._last_structured_metrics
     assert metrics is not None
+    assert metrics["router_mode"] == "shared"
     assert metrics["slot_mean"].shape == (192,)
+    assert metrics["slot_mean_per_head"].shape == (1, 192)
     assert metrics["square_mean"].shape == (64,)
+    assert metrics["square_mean_per_head"].shape == (1, 64)
     assert metrics["source_mass"].shape == (3,)
+    assert metrics["source_mass_per_head"].shape == (1, 3)
     assert metrics["global_mean"].shape == (2,)
+    assert metrics["global_mean_per_head"].shape == (1, 2)
+    assert metrics["effective_gate_abs_mean_per_head"].shape == (4,)
+    assert metrics["token_gate_logit_mean_per_head"].shape == (4,)
     torch.testing.assert_close(metrics["slot_mean"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
     torch.testing.assert_close(metrics["square_mean"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
     torch.testing.assert_close(metrics["source_mass"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
     torch.testing.assert_close(metrics["global_mean"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
+    torch.testing.assert_close(metrics["effective_gate_abs_mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(metrics["token_gate_logit_mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
 
 
 def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalization():
@@ -288,6 +298,7 @@ def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalizati
         recurrent_query_state_dim=8,
         xattn_mode="structured_square_mixer",
     )
+    xattn.eval()
     xattn.set_last_token_trace_capture(True)
 
     xattn(
@@ -301,10 +312,16 @@ def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalizati
 
     trace = xattn._last_token_trace
     assert trace is not None
+    assert trace["router_mode"] == "shared"
     assert trace["raw_slot_weights"].shape == (2, 192)
     assert trace["source_square_weights"].shape == (2, 3, 64)
     assert trace["aggregate_square_weights"].shape == (2, 64)
     assert trace["global_weights"].shape == (2, 2)
+    assert trace["effective_head_gates"].shape == (2, 4)
+    assert trace["token_gate_logits"].shape == (2, 4)
+    assert trace["source_square_contribution_norms"].shape == (2, 3, 64)
+    assert trace["aggregate_square_contribution_norms"].shape == (2, 64)
+    assert trace["global_contribution_norms"].shape == (2, 2)
     torch.testing.assert_close(
         trace["raw_slot_weights"].sum(dim=-1),
         torch.ones(2),
@@ -329,6 +346,24 @@ def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalizati
         atol=1e-5,
         rtol=0.0,
     )
+    torch.testing.assert_close(
+        trace["effective_head_gates"],
+        torch.zeros(2, 4),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["aggregate_square_contribution_norms"],
+        torch.zeros_like(trace["aggregate_square_contribution_norms"]),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["global_contribution_norms"],
+        torch.zeros_like(trace["global_contribution_norms"]),
+        atol=1e-6,
+        rtol=0.0,
+    )
 
 
 def test_structured_square_mixer_last_token_trace_uses_last_valid_token():
@@ -341,6 +376,7 @@ def test_structured_square_mixer_last_token_trace_uses_last_valid_token():
         recurrent_query_state_dim=8,
         xattn_mode="structured_square_mixer",
     )
+    xattn.eval()
     xattn.set_last_token_trace_capture(True)
     text_attention_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.long)
 
@@ -360,7 +396,7 @@ def test_structured_square_mixer_last_token_trace_uses_last_valid_token():
     rq_state = xattn._last_recurrent_query_state
     assert rq_state is not None
     global_perceiver_cond = inputs["perceiver_latents"][:, 64, :].unsqueeze(1).expand(-1, 4, -1)
-    square_weight_inputs = torch.cat([rq_state, global_perceiver_cond], dim=-1)
+    square_weight_inputs = xattn.structured_router_stem(torch.cat([rq_state, global_perceiver_cond], dim=-1))
     all_square_weights = torch.softmax(
         xattn.structured_square_weight_proj(square_weight_inputs).float(),
         dim=-1,
@@ -387,6 +423,7 @@ def test_structured_square_mixer_square_weights_condition_on_global_perceiver_la
     square_weight_proj = xattn.structured_square_weight_proj
     assert isinstance(square_weight_proj, nn.Linear)
     assert square_weight_proj.in_features == 16
+    xattn.structured_router_stem = nn.Identity()
 
     with torch.no_grad():
         square_weight_proj.weight.zero_()
@@ -426,6 +463,258 @@ def test_structured_square_mixer_square_weights_condition_on_global_perceiver_la
     shifted_slot_mean = xattn._last_structured_metrics["slot_mean"].clone()
 
     assert not torch.allclose(baseline_slot_mean, shifted_slot_mean)
+
+
+def test_structured_square_mixer_per_head_trace_capture_shapes_and_normalization():
+    inputs = _make_inputs(batch_size=2, seq_len=4)
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        structured_router_mode="per_head",
+    )
+    xattn.eval()
+    xattn.set_last_token_trace_capture(True)
+
+    xattn(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+    )
+
+    trace = xattn._last_token_trace
+    assert trace is not None
+    assert trace["router_mode"] == "per_head"
+    assert trace["raw_slot_weights"].shape == (2, 192)
+    assert trace["aggregate_square_weights"].shape == (2, 64)
+    assert trace["raw_slot_weights_per_head"].shape == (2, 4, 192)
+    assert trace["source_square_weights_per_head"].shape == (2, 4, 3, 64)
+    assert trace["aggregate_square_weights_per_head"].shape == (2, 4, 64)
+    assert trace["global_weights_per_head"].shape == (2, 4, 2)
+    assert trace["effective_head_gates"].shape == (2, 4)
+    assert trace["token_gate_logits"].shape == (2, 4)
+    assert trace["source_square_contribution_norms"].shape == (2, 3, 64)
+    assert trace["aggregate_square_contribution_norms"].shape == (2, 64)
+    assert trace["global_contribution_norms"].shape == (2, 2)
+    assert trace["source_square_contribution_norms_per_head"].shape == (2, 4, 3, 64)
+    assert trace["aggregate_square_contribution_norms_per_head"].shape == (2, 4, 64)
+    assert trace["global_contribution_norms_per_head"].shape == (2, 4, 2)
+    torch.testing.assert_close(
+        trace["raw_slot_weights_per_head"].sum(dim=-1),
+        torch.ones(2, 4),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["aggregate_square_weights_per_head"].sum(dim=-1),
+        torch.ones(2, 4),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["global_weights_per_head"].sum(dim=-1),
+        torch.ones(2, 4),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["raw_slot_weights"],
+        trace["raw_slot_weights_per_head"].mean(dim=1),
+        atol=1e-5,
+        rtol=0.0,
+    )
+
+
+def test_structured_square_mixer_contribution_norm_trace_is_normalized():
+    inputs = _make_inputs(batch_size=1, seq_len=4)
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        structured_router_mode="per_head",
+        text_gate_mode="none",
+    )
+    xattn.eval()
+    xattn.set_last_token_trace_capture(True)
+
+    with torch.no_grad():
+        xattn.gate.fill_(math.atanh(0.5))
+
+    xattn(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+    )
+
+    trace = xattn._last_token_trace
+    assert trace is not None
+    torch.testing.assert_close(
+        trace["aggregate_square_contribution_norms"],
+        trace["source_square_contribution_norms"].sum(dim=1),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["aggregate_square_contribution_norms_per_head"],
+        trace["source_square_contribution_norms_per_head"].sum(dim=2),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    total_mass = trace["aggregate_square_contribution_norms"].sum(dim=-1) + trace["global_contribution_norms"].sum(dim=-1)
+    per_head_total_mass = (
+        trace["aggregate_square_contribution_norms_per_head"].sum(dim=-1)
+        + trace["global_contribution_norms_per_head"].sum(dim=-1)
+    )
+    torch.testing.assert_close(total_mass, torch.ones_like(total_mass), atol=1e-5, rtol=0.0)
+    torch.testing.assert_close(per_head_total_mass, torch.ones_like(per_head_total_mass), atol=1e-5, rtol=0.0)
+
+
+def test_structured_square_mixer_zero_init_tanh_head_matches_none_mode():
+    inputs = _make_inputs(batch_size=1, seq_len=4)
+    base = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        text_gate_mode="none",
+    )
+    gated = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        text_gate_mode="tanh_head",
+    )
+    missing, unexpected = gated.load_state_dict(base.state_dict(), strict=False)
+    assert unexpected == []
+    assert sorted(missing) == ["text_gate_mlp.bias", "text_gate_mlp.weight"]
+    base.eval()
+    gated.eval()
+    base.set_last_token_trace_capture(True)
+    gated.set_last_token_trace_capture(True)
+
+    base_out = base(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+    )
+    gated_out = gated(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+    )
+
+    torch.testing.assert_close(base_out, gated_out, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        base._last_token_trace["aggregate_square_weights"],
+        gated._last_token_trace["aggregate_square_weights"],
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        gated._last_token_trace["token_gate_logits"],
+        torch.zeros_like(gated._last_token_trace["token_gate_logits"]),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+
+def test_adapter_compute_auxiliary_losses_includes_gate_usage_loss():
+    cfg = ChessFusionConfig(
+        use_cnn=False,
+        use_transformer_taps=False,
+        use_chess_structure_mp=True,
+        csmp_layers=1,
+        csmp_heads=8,
+        csmp_dim=8,
+        csmp_pos_dim=4,
+        csmp_piece_dim=4,
+        tap_projection_dim=8,
+        structured_latents=True,
+        num_latents=65,
+        perceiver_depth=1,
+        perceiver_dim=8,
+        perceiver_heads=4,
+        use_structured_policy_head=True,
+        structured_policy_query_layers=1,
+        structured_policy_query_heads=4,
+        structured_policy_ffn_mult=2,
+        xattn_layers=[0],
+        xattn_mode="structured_square_mixer",
+        xattn_heads=4,
+        xattn_recurrent_query_state_dim=8,
+        xattn_text_gate_mode="none",
+        aux_policy_weight=0.0,
+        structured_xattn_sparse_weight=0.0,
+        structured_xattn_square_diversity_weight=0.0,
+        structured_xattn_gate_usage_weight=0.6,
+        structured_xattn_gate_usage_target=0.4,
+        enable_lm_prepend_latents=False,
+        enable_lm_pseudotokens=False,
+    )
+    adapter = ChessFusionAdapter(SimpleNamespace(chess_fusion=cfg), llm_dim=16, llm_num_heads=4)
+    inputs = _make_inputs(seq_len=5, llm_dim=16, perceiver_dim=8, context_dim=8)
+
+    with torch.no_grad():
+        adapter.gated_xattns[0].gate.fill_(math.atanh(0.2))
+
+    adapter.gated_xattns[0](
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"],
+        policy_latents=inputs["policy_latents"],
+    )
+
+    losses = adapter.compute_auxiliary_losses(
+        policy_logits=torch.zeros(inputs["hidden_states"].size(0), 8),
+        eval_logits=None,
+        policy_targets=None,
+    )
+
+    expected_usage = torch.tensor(0.2)
+    expected_loss = torch.tensor(0.2)
+    torch.testing.assert_close(
+        losses["structured_xattn_gate_usage_mean_abs"],
+        expected_usage,
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        losses["structured_xattn_gate_usage_loss"],
+        expected_loss,
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        losses["total_aux_loss"],
+        cfg.structured_xattn_gate_usage_weight * expected_loss,
+        atol=1e-5,
+        rtol=0.0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -578,6 +867,8 @@ def test_adapter_exposes_named_structured_xattn_metrics():
     assert "structured_xattn/layer_0/perceiver/slot_max_square_index" in metrics
     assert "structured_xattn/layer_0/source_mass/policy" in metrics
     assert "structured_xattn/layer_0/global_mass/side_token" in metrics
+    assert "structured_xattn/layer_0/effective_gate_abs_mean" in metrics
+    assert "structured_xattn/layer_0/token_gate_logit_mean" in metrics
 
 
 def test_adapter_compute_auxiliary_losses_includes_structured_xattn_sparse_loss():
@@ -716,6 +1007,8 @@ def test_training_controller_round_trips_structured_xattn_sparse_weight(monkeypa
         structured_xattn_sparse_weight=0.15,
         structured_xattn_square_diversity_weight=0.2,
         structured_xattn_square_diversity_target_entropy=0.65,
+        structured_xattn_gate_usage_weight=0.12,
+        structured_xattn_gate_usage_target=0.3,
     )
     controller = TrainingController(output_dir="unused-test-dir", poll_steps=1)
     config = SimpleNamespace(
@@ -746,11 +1039,15 @@ def test_training_controller_round_trips_structured_xattn_sparse_weight(monkeypa
     assert state["status"]["active_structured_xattn_sparse_weight"] == pytest.approx(0.15)
     assert state["status"]["active_structured_xattn_square_diversity_weight"] == pytest.approx(0.2)
     assert state["status"]["active_structured_xattn_square_diversity_target_entropy"] == pytest.approx(0.65)
+    assert state["status"]["active_structured_xattn_gate_usage_weight"] == pytest.approx(0.12)
+    assert state["status"]["active_structured_xattn_gate_usage_target"] == pytest.approx(0.3)
 
     updated_state = controller._read_state()
     updated_state["structured_xattn_sparse_weight"] = 0.35
     updated_state["structured_xattn_square_diversity_weight"] = 0.45
     updated_state["structured_xattn_square_diversity_target_entropy"] = 0.8
+    updated_state["structured_xattn_gate_usage_weight"] = 0.25
+    updated_state["structured_xattn_gate_usage_target"] = 0.55
     controller._write_state(updated_state)
 
     changes = controller.poll()
@@ -759,6 +1056,10 @@ def test_training_controller_round_trips_structured_xattn_sparse_weight(monkeypa
     assert changes["structured_xattn_sparse_weight"] == pytest.approx(0.35)
     assert changes["structured_xattn_square_diversity_weight"] == pytest.approx(0.45)
     assert changes["structured_xattn_square_diversity_target_entropy"] == pytest.approx(0.8)
+    assert changes["structured_xattn_gate_usage_weight"] == pytest.approx(0.25)
+    assert changes["structured_xattn_gate_usage_target"] == pytest.approx(0.55)
     assert controller._read_state()["structured_xattn_sparse_weight"] is None
     assert controller._read_state()["structured_xattn_square_diversity_weight"] is None
     assert controller._read_state()["structured_xattn_square_diversity_target_entropy"] is None
+    assert controller._read_state()["structured_xattn_gate_usage_weight"] is None
+    assert controller._read_state()["structured_xattn_gate_usage_target"] is None

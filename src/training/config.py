@@ -148,6 +148,8 @@ class ChessFusionConfig:
     xattn_mode: Literal["recurrent_query_attn", "structured_square_mixer"] = "recurrent_query_attn"
     xattn_heads: int = 16
     xattn_gate_init: float = 0.0         # tanh gate init value (0 = identity at start)
+    xattn_structured_router_mode: Literal["shared", "per_head"] = "shared"  # structured mixer: shared slot router or independent per-head routers
+    xattn_text_gate_mode: Literal["none", "tanh_head"] = "tanh_head"  # structured mixer only: optional token-conditioned per-head tanh gate logits
     xattn_dropout: float = 0.1           # Dropout in xattn attention + FFN
     xattn_ffn_mult: int = 2              # FFN expansion multiplier in xattn (2x instead of 4x)
     xattn_recurrent_query_state_dim: int = 256 # GRU hidden size for recurrent-query state used by both fusion modes
@@ -168,6 +170,8 @@ class ChessFusionConfig:
     structured_xattn_sparse_weight: float = 0.0  # Entropy penalty on structured_square_mixer square marginals (lower = sparser over 64 squares)
     structured_xattn_square_diversity_weight: float = 0.0  # Encourage aggregate square usage to stay above a target entropy floor
     structured_xattn_square_diversity_target_entropy: float = 0.5  # Normalized target entropy floor in [0, 1] over mean 64-square usage
+    structured_xattn_gate_usage_weight: float = 0.0  # Weak floor on mean absolute effective structured x-attn gate usage
+    structured_xattn_gate_usage_target: float = 0.1  # Target mean |effective_gate| used by the hinge loss
     num_eval_buckets: int = 5
 
     # Precomputed policy: use cached maia_policy from .pt files instead of live teacher
@@ -258,6 +262,30 @@ class ChessFusionConfig:
         if int(self.csmp_relative_edge_dim) <= 0:
             raise ValueError(
                 f"csmp_relative_edge_dim must be > 0 (got {self.csmp_relative_edge_dim})"
+            )
+        valid_router_modes = {"shared", "per_head"}
+        if self.xattn_structured_router_mode not in valid_router_modes:
+            raise ValueError(
+                "xattn_structured_router_mode must be one of "
+                "{'shared', 'per_head'} "
+                f"(got {self.xattn_structured_router_mode!r})"
+            )
+        valid_text_gate_modes = {"none", "tanh_head"}
+        if self.xattn_text_gate_mode not in valid_text_gate_modes:
+            raise ValueError(
+                "xattn_text_gate_mode must be one of "
+                "{'none', 'tanh_head'} "
+                f"(got {self.xattn_text_gate_mode!r})"
+            )
+        if self.structured_xattn_gate_usage_weight < 0:
+            raise ValueError(
+                "structured_xattn_gate_usage_weight must be >= 0 "
+                f"(got {self.structured_xattn_gate_usage_weight})"
+            )
+        if not 0.0 <= self.structured_xattn_gate_usage_target <= 1.0:
+            raise ValueError(
+                "structured_xattn_gate_usage_target must be in [0, 1] "
+                f"(got {self.structured_xattn_gate_usage_target})"
             )
 
 @dataclass

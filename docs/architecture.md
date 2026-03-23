@@ -12,7 +12,7 @@ The core idea is to keep square-level structure alive for as long as possible, r
 
 ## 1. Input Representation
 
-Every position is encoded as an 18-channel `8x8` board tensor (piece placement, side to move, castling rights, en passant). The board-only encoder builds square tokens directly from learned positional and piece embeddings — no pretrained CNN backbone is required.
+Every position is encoded as an 18-channel `8x8` board tensor (piece placement, side to move, castling rights, en passant). The board-only encoder builds square tokens directly from learned positional and piece embeddings; no pretrained CNN backbone is required.
 
 Source: `src/training/maia_model.py`
 
@@ -34,19 +34,19 @@ CSMP supports three modes for how square pairs interact:
 
 | Mode | Behavior |
 |------|----------|
-| `none` | Masks-only baseline — routing is purely content-driven |
-| `score_bias` | Adds learned bias indexed by `(head, delta_rank, delta_file)` — changes routing, not values |
-| `edge_modulation` | Learned edge embeddings modulate both keys and values — more expressive but more expensive |
+| `none` | Masks-only baseline; routing is purely content-driven |
+| `score_bias` | Adds learned bias indexed by `(head, delta_rank, delta_file)`; changes routing, not values |
+| `edge_modulation` | Learned edge embeddings modulate both keys and values; more expressive but more expensive |
 
 Source: `src/training/chess_structure_mp.py`
 
 ## 3. Structured Perceiver Latents
 
-`SquareLatentEncoder` is a Perceiver-style bottleneck with **65 structured latents**: 64 square-aligned + 1 global.
+`SquareLatentEncoder` is a Perceiver-style bottleneck with **65 structured latents**: 64 square-aligned plus 1 global.
 
-Each Perceiver block runs: latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent primarily reads its own square token, while the global latent aggregates across the full board. This preserves square identity throughout.
+Each Perceiver block runs latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent primarily reads its own square token, while the global latent aggregates across the full board. This preserves square identity throughout.
 
-A second readout, `_structured_policy_square_readout()`, produces 64 policy latents — the shared representation used by both the auxiliary chess heads and the LLM fusion bridge.
+A second readout, `_structured_policy_square_readout()`, produces 64 policy latents; the shared representation used by both the auxiliary chess heads and the LLM fusion bridge.
 
 Source: `src/training/chess_fusion_model.py`
 
@@ -55,7 +55,7 @@ Source: `src/training/chess_fusion_model.py`
 The latent space is trained with several chess objectives. All prediction branches share the same 64 policy latents from the Perceiver readout, then specialize via their own `StructuredSquareBranchLayer`.
 
 | Head | What it predicts |
-|------|-----------------|
+|------|------------------|
 | **Policy distillation** | Maia move probabilities (1880-move vocabulary, from/to dot product scoring) |
 | **Move-eval ranking** | Soft CE + pairwise ranking over candidate moves |
 | **Move-eval regression** | MSE on centipawn scores + mate classification |
@@ -68,11 +68,24 @@ These losses let the adapter learn chess structure even when the LLM is frozen o
 
 Selected decoder layers are wrapped with `FusionDecoderLayer`, which injects chess context via gated cross-attention.
 
-The active fusion mode is **structured square mixer**: each text token learns a soft weighting over `64 x 3` aligned slots (CSMP, Perceiver, Policy per square), conditioned on its text latent and the Perceiver global latent. A separate global branch mixes the Perceiver global latent and side-to-move token.
+The active fusion mode is **structured square mixer**. A shared router-conditioning MLP consumes the recurrent text state together with the Perceiver global latent, then emits:
 
-The LLM reads the shared policy latents and generic Perceiver/CSMP sources — not the branch-specific prediction heads. This keeps one square-aligned representation central to both chess supervision and text generation.
+- square-router logits over `64 x 3` aligned slots (CSMP, Perceiver, Policy per square)
+- global-router logits over the Perceiver global latent vs the side-to-move token
+- optional token-conditioned per-head gate logits
+
+By default (`xattn_structured_router_mode: shared`), one `192`-way square router is shared across all x-attn heads for a token. That is the backward-compatible path and keeps the aggregate inspector view easy to read. With `xattn_structured_router_mode: per_head`, each x-attn head gets its own square/global router so different heads can specialize on different squares or source types.
+
+The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
+
+`tanh(static_head_gate + token_gate_logit)`
+
+That dynamic gate is intentionally produced from the same router stem as the square/global routing decisions, so "which chess features matter?" and "how much chess should I inject?" are conditioned on the same token state.
+
+The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps one square-aligned representation central to both chess supervision and text generation.
 
 Additional injection mechanisms:
+
 - **Prepended latents**: chess latents projected into the LLM embedding space as prefix tokens
 - **Layer pseudotokens**: per-layer learned KV pairs added to the attention context
 
@@ -83,6 +96,7 @@ Source: `src/training/chess_fusion_model.py`
 ## Supported LLM Backends
 
 The fusion layer supports common HuggingFace decoder stacks:
+
 - LLaMA-family (default: TinyLlama 1.1B with LoRA)
 - GPT-NeoX-family
 - GPT-2-style

@@ -3658,6 +3658,8 @@ def train(config: TrainingConfig):
     running_structured_xattn_sparse_loss = 0.0
     running_structured_xattn_square_diversity_loss = 0.0
     running_structured_xattn_square_usage_entropy = 0.0
+    running_structured_xattn_gate_usage_loss = 0.0
+    running_structured_xattn_gate_usage_mean_abs = 0.0
     running_bsr_loss = 0.0
     running_spp_loss = 0.0
     running_move_eval_loss = 0.0
@@ -4037,6 +4039,8 @@ def train(config: TrainingConfig):
                 running_structured_xattn_sparse_loss += aux.get('structured_xattn_sparse_loss', torch.tensor(0.0)).item() / ga
                 running_structured_xattn_square_diversity_loss += aux.get('structured_xattn_square_diversity_loss', torch.tensor(0.0)).item() / ga
                 running_structured_xattn_square_usage_entropy += aux.get('structured_xattn_square_usage_entropy', torch.tensor(0.0)).item() / ga
+                running_structured_xattn_gate_usage_loss += aux.get('structured_xattn_gate_usage_loss', torch.tensor(0.0)).item() / ga
+                running_structured_xattn_gate_usage_mean_abs += aux.get('structured_xattn_gate_usage_mean_abs', torch.tensor(0.0)).item() / ga
                 running_bsr_loss += aux.get('bsr_loss', torch.tensor(0.0)).item() / ga
                 running_spp_loss += aux.get('spp_loss', torch.tensor(0.0)).item() / ga
                 running_move_eval_loss += aux.get('move_eval_loss', torch.tensor(0.0)).item() / ga
@@ -4198,6 +4202,37 @@ def train(config: TrainingConfig):
                                 if config.use_wandb:
                                     wandb.log({
                                         "live_control/structured_xattn_square_diversity_target_entropy": new_sxdt,
+                                    }, step=global_step)
+                        if "structured_xattn_gate_usage_weight" in changes:
+                            new_sxguw = changes["structured_xattn_gate_usage_weight"]
+                            sxguw_cfg = config.model.chess_fusion if config.model.mode in ("chess_fusion", "policy_only") else config.model.maia
+                            old_sxguw = getattr(sxguw_cfg, 'structured_xattn_gate_usage_weight', 0.0)
+                            if new_sxguw != old_sxguw:
+                                sxguw_cfg.structured_xattn_gate_usage_weight = new_sxguw
+                                print(f"\n[Live Control] Structured x-attn gate usage weight: {old_sxguw} -> {new_sxguw}")
+                                controller.update_status(
+                                    active_structured_xattn_gate_usage_weight=new_sxguw,
+                                    last_command_applied="set_structured_xattn_gate_usage_weight",
+                                )
+                                if config.use_wandb:
+                                    wandb.log({
+                                        "live_control/structured_xattn_gate_usage_weight": new_sxguw,
+                                    }, step=global_step)
+                        if "structured_xattn_gate_usage_target" in changes:
+                            new_sxgut = float(changes["structured_xattn_gate_usage_target"])
+                            new_sxgut = max(0.0, min(1.0, new_sxgut))
+                            sxgut_cfg = config.model.chess_fusion if config.model.mode in ("chess_fusion", "policy_only") else config.model.maia
+                            old_sxgut = getattr(sxgut_cfg, 'structured_xattn_gate_usage_target', 0.1)
+                            if new_sxgut != old_sxgut:
+                                sxgut_cfg.structured_xattn_gate_usage_target = new_sxgut
+                                print(f"\n[Live Control] Structured x-attn gate usage target: {old_sxgut} -> {new_sxgut}")
+                                controller.update_status(
+                                    active_structured_xattn_gate_usage_target=new_sxgut,
+                                    last_command_applied="set_structured_xattn_gate_usage_target",
+                                )
+                                if config.use_wandb:
+                                    wandb.log({
+                                        "live_control/structured_xattn_gate_usage_target": new_sxgut,
                                     }, step=global_step)
 
                         # Apply move-eval objective weights
@@ -5155,6 +5190,9 @@ def train(config: TrainingConfig):
                         if getattr(maia_cfg, 'structured_xattn_square_diversity_weight', 0.0) > 0:
                             logs["train/structured_xattn_square_diversity_loss"] = running_structured_xattn_square_diversity_loss / n
                             logs["train/structured_xattn_square_usage_entropy"] = running_structured_xattn_square_usage_entropy / n
+                        if getattr(maia_cfg, 'structured_xattn_gate_usage_weight', 0.0) > 0:
+                            logs["train/structured_xattn_gate_usage_loss"] = running_structured_xattn_gate_usage_loss / n
+                            logs["train/structured_xattn_gate_usage_mean_abs"] = running_structured_xattn_gate_usage_mean_abs / n
                         if getattr(maia_cfg, 'bsr_weight', 0.0) > 0:
                             logs["train/bsr_loss"] = running_bsr_loss / n
                         if getattr(maia_cfg, 'spp_weight', 0.0) > 0:
@@ -5174,6 +5212,8 @@ def train(config: TrainingConfig):
                         logs["train/structured_xattn_sparse_weight"] = getattr(maia_cfg, 'structured_xattn_sparse_weight', 0.0)
                         logs["train/structured_xattn_square_diversity_weight"] = getattr(maia_cfg, 'structured_xattn_square_diversity_weight', 0.0)
                         logs["train/structured_xattn_square_diversity_target_entropy"] = getattr(maia_cfg, 'structured_xattn_square_diversity_target_entropy', 0.5)
+                        logs["train/structured_xattn_gate_usage_weight"] = getattr(maia_cfg, 'structured_xattn_gate_usage_weight', 0.0)
+                        logs["train/structured_xattn_gate_usage_target"] = getattr(maia_cfg, 'structured_xattn_gate_usage_target', 0.1)
                         # Perceiver cross-attention entropy
                         if running_entropy_count > 0:
                             logs["entropy/cross_attn_mean"] = running_entropy_sum / running_entropy_count
@@ -5217,6 +5257,8 @@ def train(config: TrainingConfig):
                     running_structured_xattn_sparse_loss = 0.0
                     running_structured_xattn_square_diversity_loss = 0.0
                     running_structured_xattn_square_usage_entropy = 0.0
+                    running_structured_xattn_gate_usage_loss = 0.0
+                    running_structured_xattn_gate_usage_mean_abs = 0.0
                     running_bsr_loss = 0.0
                     running_spp_loss = 0.0
                     running_move_eval_loss = 0.0
@@ -5248,6 +5290,8 @@ def train(config: TrainingConfig):
                         active_structured_xattn_sparse_weight=getattr(_target.adapter.cfg, "structured_xattn_sparse_weight", 0.0),
                         active_structured_xattn_square_diversity_weight=getattr(_target.adapter.cfg, "structured_xattn_square_diversity_weight", 0.0),
                         active_structured_xattn_square_diversity_target_entropy=getattr(_target.adapter.cfg, "structured_xattn_square_diversity_target_entropy", 0.5),
+                        active_structured_xattn_gate_usage_weight=getattr(_target.adapter.cfg, "structured_xattn_gate_usage_weight", 0.0),
+                        active_structured_xattn_gate_usage_target=getattr(_target.adapter.cfg, "structured_xattn_gate_usage_target", 0.1),
                         active_aux_move_eval_weight=getattr(_target.adapter.cfg, "aux_move_eval_weight", 0.0),
                         active_move_eval_mse_weight=getattr(_target.adapter.cfg, "move_eval_mse_weight", 0.5),
                         active_move_eval_ce_weight=getattr(_target.adapter.cfg, "move_eval_ce_weight", 0.5),

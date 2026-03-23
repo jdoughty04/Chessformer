@@ -15,6 +15,8 @@ Use the inspector when you want to answer questions like:
 - how peaked or uncertain the next-token distribution is
 - which squares a selected cross-attention layer used to produce the last token
 - whether a layer is reading more from CSMP, Perceiver, or Policy latents
+- whether a `per_head` router is specializing different x-attn heads differently
+- how large the token-conditioned effective chess gates are for the current token
 
 This is primarily an interpretability and debugging tool for
 `xattn_mode: structured_square_mixer`.
@@ -89,6 +91,16 @@ This view is about what the model will do next, not what it did previously.
 
 The layer dropdown chooses which fusion layer's routing to visualize.
 
+The head dropdown behaves as follows:
+
+- `All Heads` shows the backward-compatible aggregate view
+- for `xattn_structured_router_mode: per_head`, individual head options expose that head's own square and global routing
+- for `xattn_structured_router_mode: shared`, the head selector is disabled because all heads share one router
+- the `View` dropdown chooses how `All Heads` is aggregated:
+  - `Mean Router`: plain mean over per-head router distributions
+  - `Gate-Weighted Router`: mean over per-head router distributions weighted by `|effective_gate_h|`
+  - `Contribution Norm`: normalized post-gate, post-`o_proj` contribution magnitudes rather than raw router mass
+
 The boards always correspond to the selected layer's routing for the last valid
 text token processed in that decode step.
 
@@ -116,6 +128,15 @@ $$
 This is the easiest high-level answer to "which board squares mattered most for
 this token?"
 
+When `per_head` routing is enabled and the head selector is left on `All Heads`,
+the interpretation depends on the selected `View`:
+
+- `Mean Router`: mean over heads of the per-head 64-square distributions
+- `Gate-Weighted Router`: the same per-head 64-square distributions, but weighted
+  by `|effective_gate_h|`
+- `Contribution Norm`: normalized attribution mass derived from the actual
+  gated, projected square contributions instead of router probabilities
+
 ### Source Boards
 
 The three source boards split that aggregate mass by aligned source type:
@@ -140,9 +161,28 @@ Under the hood, the structured mixer routes over `192` aligned slots:
 - `64` Perceiver square slots
 - `64` Policy square slots
 
-The GUI's board views are derived from those raw `192` values. Tooltips and raw
-value labels are meant to make that relationship inspectable without forcing you
-to look at the tensor directly.
+With `xattn_structured_router_mode: per_head`, each head gets its own `192`-way
+router and its own `2`-way global router. Individual head selection always
+shows the actual head-specific boards. `All Heads` depends on the selected view:
+
+- `Mean Router` is the old mean-over-heads display
+- `Gate-Weighted Router` biases the aggregate toward more-open heads
+- `Contribution Norm` uses the routed value vectors, head gates, and `o_proj` to
+  show normalized contribution magnitudes
+
+The GUI's board views are derived from those raw routing values. Tooltips and
+raw value labels are meant to make that relationship inspectable without
+forcing you to look at the tensor directly.
+
+### Gate Readouts
+
+The trace metadata row now also shows:
+
+- the router mode (`shared` vs `per_head`)
+- the selected view (`Mean Router`, `Gate-Weighted Router`, or `Contribution Norm`)
+- mean absolute effective gate over heads for the selected token
+- mean token-gate logit over heads
+- when a single head is selected, that head's effective gate and token-gate logit
 
 ## How One Decode Step Maps To The Model
 
@@ -177,6 +217,11 @@ The inspector is the visual counterpart to
 - top-5 next tokens come from the current decoder logits
 - `CSMP`, `Perceiver`, and `Policy` boards correspond to the three aligned slot groups
 - `Aggregate` corresponds to the source-marginalized 64-square distribution
+- the head selector lets you switch between the mean-over-heads view and
+  individual head routing when available
+- the view selector lets you switch between raw router mass, gate-weighted
+  router mass, and normalized contribution attribution
+- the metadata row exposes the token-conditioned effective gate values
 - the per-layer view lets you compare how routing changes across decoder depth
 
 If you want the exact equations, use the math doc. If you want to see one decode

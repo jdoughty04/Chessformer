@@ -25,7 +25,7 @@ training:
 
   num_epochs: 10
   batch_size: 32                    # per-device batch size
-  gradient_accumulation_steps: 2    # effective batch = batch_size * accumulation
+  gradient_accumulation_steps: 1    # effective batch = batch_size * accumulation
   learning_rate: 1.0e-4
   gradient_clip_val: null           # null = no clipping
   warmup_ratio: 0.015              # fraction of total steps for LR warmup
@@ -40,7 +40,7 @@ training:
 
   # Chess token weighting: upweight loss on chess-relevant tokens to improve
   # grounding. Set chess_token_weight_enabled: false to use uniform weighting.
-  chess_token_weight_enabled: true
+  chess_token_weight_enabled: false
   chess_token_weight_squares: 3.0  # square names (e1, d4, ...)
   chess_token_weight_pieces: 2.0   # piece names (knight, bishop, ...)
   chess_token_weight_moves: 2.5    # move notation (Nf3, Bxe5, ...)
@@ -79,6 +79,7 @@ training:
 # --- Model -------------------------------------------------------------------
 model:
   base_model: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  #base_model: "Waterhorse/chessgpt-base-v1"
 
   load_in_8bit: false
   load_in_4bit: false
@@ -125,7 +126,7 @@ model:
     csmp_heads: 8                  # attention heads (each assigned to a relation type)
     csmp_dim: 1024                 # hidden dimension
     csmp_pos_dim: 512              # positional embedding dimension
-    csmp_piece_dim: 256            # piece embedding dimension
+    csmp_piece_dim: 32            # piece embedding dimension
     csmp_ffn_mult: 4               # FFN expansion factor
     csmp_dropout: 0.2
 
@@ -139,7 +140,7 @@ model:
     #   none            - masks only, content-driven routing (simplest)
     #   score_bias      - learned (head, delta_rank, delta_file) bias on attention scores
     #   edge_modulation - learned edge embeddings modulate keys AND values (most expressive)
-    csmp_relative_mode: none
+    csmp_relative_mode: edge_modulation
     csmp_relative_edge_dim: 16     # edge embedding dim (only used with edge_modulation)
     csmp_ablation_no_mask: false   # set true to ablate all chess masks (for comparison)
 
@@ -191,6 +192,8 @@ model:
     xattn_mode: structured_square_mixer
     xattn_heads: 16
     xattn_gate_init: 0.0           # initial gate value (0 = start with no chess signal)
+    xattn_structured_router_mode: per_head   # shared = one 192-way router per token; per_head = independent router per x-attn head
+    xattn_text_gate_mode: tanh_head        # tanh_head = per-token dynamic head gates from the router stem; none = static gates only
     xattn_dropout: 0.1
     xattn_ffn_mult: 4
 
@@ -198,11 +201,11 @@ model:
     # to build per-token query states via GRU).
     xattn_recurrent_query_state_dim: 1024
     xattn_recurrent_query_use_mlp: true
-    xattn_recurrent_query_share_gru_across_layers: true
+    xattn_recurrent_query_share_gru_across_layers: false
 
     # Prepended chess latents: project chess latents into the LLM embedding
     # space and prepend them as prefix tokens before the text.
-    enable_lm_prepend_latents: true
+    enable_lm_prepend_latents: false
     num_lm_prepend_latents: 64
     lm_prepend_latent_mode: structured_mlp
     lm_prepend_latents_use_positional_encoding: true
@@ -210,7 +213,7 @@ model:
     # Layer pseudotokens: per-layer learned KV pairs added to the attention
     # context at specified decoder layers. A lightweight way to inject
     # layer-specific learned context.
-    enable_lm_pseudotokens: false
+    enable_lm_pseudotokens: true
     num_lm_pseudotokens: 4
     lm_pseudotoken_layers: [0, 4, 7, 11, 15, 18, 21]
 
@@ -227,9 +230,12 @@ model:
     # Router regularization (structured square mixer only):
     # Sparsity encourages each text token to focus on few squares.
     # Diversity prevents all tokens from collapsing to the same squares.
-    structured_xattn_sparse_weight: 1.0
-    structured_xattn_square_diversity_weight: 1.0
+    # Gate-usage keeps the token-conditioned gates from collapsing to zero everywhere.
+    structured_xattn_sparse_weight: 0.1
+    structured_xattn_square_diversity_weight: 0.1
     structured_xattn_square_diversity_target_entropy: 1.0
+    structured_xattn_gate_usage_weight: 0.1
+    structured_xattn_gate_usage_target: 0.1
 
     # Move evaluation objective: ranks and scores candidate moves using
     # engine evaluations from the training data. Requires move_evals in .pt files.
@@ -237,9 +243,9 @@ model:
     move_eval_dim: 1024
     move_eval_cp_scale: 512.0      # normalize centipawn targets
     move_eval_cp_clip: 2000.0      # clip extreme values for stability
-    move_eval_mse_weight: 1.0      # MSE regression balance
-    move_eval_ce_weight: 0.1       # soft CE balance
-    move_eval_pairwise_weight: 1.0 # pairwise ranking balance
+    move_eval_mse_weight: 0.1      # MSE regression balance
+    move_eval_ce_weight: 0.001       # soft CE balance
+    move_eval_pairwise_weight: 0.001 # pairwise ranking balance
     move_eval_pairwise_topk: 5
     move_eval_pairwise_cp_margin: 10.0
     move_eval_pairwise_temperature: 1.0
@@ -269,18 +275,18 @@ model:
     freeze_transformer: true
     freeze_csmp: true
     freeze_perceiver: true
-    freeze_xattn: false
-    freeze_prepend_latents: false
+    freeze_xattn: true
+    freeze_prepend_latents: true
     freeze_lm_pseudotokens: true
 
     # Per-component learning rate multipliers (relative to base LR).
-    cnn_learning_rate: 0.01
-    perceiver_lr_ratio: 1
-    csmp_lr_ratio: 1
-    xattn_lr_ratio: 0.5
-    prepend_latent_lr_ratio: 0.5
+    cnn_learning_rate: 0.0
+    perceiver_lr_ratio: 1.0
+    csmp_lr_ratio: 1.0
+    xattn_lr_ratio: 1.0
+    prepend_latent_lr_ratio: 0.0
     pseudotoken_lr_ratio: 1.0
-    lora_lr_ratio: 1.0
+    lora_lr_ratio: 0.0
 
     # --- LoRA -----------------------------------------------------------------
     lora:

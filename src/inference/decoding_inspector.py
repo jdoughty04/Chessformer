@@ -311,7 +311,7 @@ class DecodeSession:
         raw_traces = self.model.adapter.get_last_token_structured_traces(sample_index=0)
         traces: dict[str, Any] = {}
         for layer_idx, trace in raw_traces.items():
-            traces[str(layer_idx)] = {
+            serialized = {
                 "aggregate_64": trace["aggregate_square_weights"].tolist(),
                 "csmp_64": trace["csmp_square_weights"].tolist(),
                 "perceiver_64": trace["perceiver_square_weights"].tolist(),
@@ -319,7 +319,40 @@ class DecodeSession:
                 "global_2": trace["global_weights"].tolist(),
                 "raw_slot_192": trace["raw_slot_weights"].tolist(),
                 "last_token_index": int(trace["last_token_index"].item()),
+                "router_mode": trace.get("router_mode", "shared"),
+                "effective_head_gates": trace.get("effective_head_gates", torch.zeros(0)).tolist(),
+                "token_gate_logits": trace.get("token_gate_logits", torch.zeros(0)).tolist(),
             }
+            if "aggregate_square_contribution_norms" in trace:
+                serialized["aggregate_contrib_64"] = trace["aggregate_square_contribution_norms"].tolist()
+                serialized["csmp_contrib_64"] = trace["csmp_square_contribution_norms"].tolist()
+                serialized["perceiver_contrib_64"] = trace["perceiver_square_contribution_norms"].tolist()
+                serialized["policy_contrib_64"] = trace["policy_square_contribution_norms"].tolist()
+                serialized["global_contrib_2"] = trace["global_contribution_norms"].tolist()
+            if "aggregate_square_weights_per_head" in trace:
+                serialized["aggregate_per_head_64"] = trace["aggregate_square_weights_per_head"].tolist()
+                serialized["csmp_per_head_64"] = trace["csmp_square_weights_per_head"].tolist()
+                serialized["perceiver_per_head_64"] = trace["perceiver_square_weights_per_head"].tolist()
+                serialized["policy_per_head_64"] = trace["policy_square_weights_per_head"].tolist()
+                serialized["global_per_head_2"] = trace["global_weights_per_head"].tolist()
+                serialized["raw_slot_per_head_192"] = trace["raw_slot_weights_per_head"].tolist()
+            if "aggregate_square_contribution_norms_per_head" in trace:
+                serialized["aggregate_contrib_per_head_64"] = (
+                    trace["aggregate_square_contribution_norms_per_head"].tolist()
+                )
+                serialized["csmp_contrib_per_head_64"] = (
+                    trace["csmp_square_contribution_norms_per_head"].tolist()
+                )
+                serialized["perceiver_contrib_per_head_64"] = (
+                    trace["perceiver_square_contribution_norms_per_head"].tolist()
+                )
+                serialized["policy_contrib_per_head_64"] = (
+                    trace["policy_square_contribution_norms_per_head"].tolist()
+                )
+                serialized["global_contrib_per_head_2"] = (
+                    trace["global_contribution_norms_per_head"].tolist()
+                )
+            traces[str(layer_idx)] = serialized
         return traces
 
     def _run_llm_forward(
@@ -850,7 +883,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <section class="hero">
       <div>
         <h1>Structured Decode Inspector</h1>
-        <p>Step through commentary generation token by token, move backward to earlier decode boundaries, inspect the live top-5 next-token distribution, and compare aggregate, CSMP, Perceiver, and Policy square weights for the currently selected x-attn layer.</p>
+        <p>Step through commentary generation token by token, move backward to earlier decode boundaries, inspect the live top-5 next-token distribution, and compare structured router views across mean, gate-weighted, and contribution-norm aggregation for the currently selected x-attn layer.</p>
       </div>
       <div class="controls">
         <div class="control">
@@ -884,7 +917,11 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="panel">
         <div class="panel-head">
           <h2>Layer Trace</h2>
-          <select id="layer-select"></select>
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <select id="layer-select"></select>
+            <select id="head-select"></select>
+            <select id="aggregation-select"></select>
+          </div>
         </div>
         <div class="panel-body">
           <div class="trace-meta" id="trace-meta"></div>
@@ -905,6 +942,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
     let session = null;
     let selectedLayer = null;
+    let selectedHead = "all";
+    let selectedAggregationMode = "mean_router";
 
     function setStatus(message, isError = false) {
       const el = document.getElementById("status-bar");
@@ -941,6 +980,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const weights = Array.isArray(trace?.[key]) ? trace[key] : new Array(64).fill(0);
       const maxWeight = Math.max(...weights, 0);
       const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+      const valueLabel = trace?.value_label || "value";
       let cells = "";
 
       for (let rank = 7; rank >= 0; rank -= 1) {
@@ -952,7 +992,7 @@ HTML_PAGE = """<!DOCTYPE html>
           const dark = (rank + file) % 2 === 1;
           const intensity = maxWeight > 0 ? value / maxWeight : 0;
           const pieceClass = piece && piece === piece.toLowerCase() ? "piece black" : "piece";
-          const titleText = `${square} | weight=${value.toFixed(6)}`;
+          const titleText = `${square} | ${valueLabel}=${value.toFixed(6)}`;
           cells += `
             <div class="square" data-square="${square}" title="${titleText}" style="background:${heatColor(dark, intensity)}">
               ${piece ? `<div class="${pieceClass}">${piece}</div>` : ""}
@@ -979,6 +1019,8 @@ HTML_PAGE = """<!DOCTYPE html>
       if (!layerStrings.length) {
         select.innerHTML = "";
         selectedLayer = null;
+        syncHeadOptions(null);
+        syncAggregationOptions(null);
         return;
       }
 
@@ -990,6 +1032,197 @@ HTML_PAGE = """<!DOCTYPE html>
         const selected = String(layer) === String(selectedLayer) ? "selected" : "";
         return `<option value="${layer}" ${selected}>Layer ${layer}</option>`;
       }).join("");
+
+      const trace = session?.layer_traces?.[String(selectedLayer)] || null;
+      syncHeadOptions(trace);
+      syncAggregationOptions(trace);
+    }
+
+    function syncHeadOptions(trace) {
+      const select = document.getElementById("head-select");
+      if (!trace) {
+        select.innerHTML = "";
+        select.disabled = true;
+        selectedHead = "all";
+        return;
+      }
+
+      const perHeadBoards = trace.aggregate_per_head_64 || [];
+      const routerMode = trace.router_mode || "shared";
+      if (routerMode !== "per_head" || !Array.isArray(perHeadBoards) || !perHeadBoards.length) {
+        selectedHead = "all";
+        select.innerHTML = `<option value="all" selected>All Heads</option>`;
+        select.disabled = true;
+        return;
+      }
+
+      const validValues = ["all", ...perHeadBoards.map((_value, idx) => String(idx))];
+      if (!validValues.includes(String(selectedHead))) {
+        selectedHead = "all";
+      }
+      select.disabled = false;
+      select.innerHTML = validValues.map((value) => {
+        const selected = String(value) === String(selectedHead) ? "selected" : "";
+        const label = value === "all" ? "All Heads" : `Head ${value}`;
+        return `<option value="${value}" ${selected}>${label}</option>`;
+      }).join("");
+    }
+
+    function syncAggregationOptions(trace) {
+      const select = document.getElementById("aggregation-select");
+      if (!trace) {
+        select.innerHTML = "";
+        select.disabled = true;
+        selectedAggregationMode = "mean_router";
+        return;
+      }
+
+      const options = [["mean_router", "Mean Router"]];
+      const hasPerHeadRouter = (
+        (trace.router_mode || "shared") === "per_head"
+        && Array.isArray(trace.aggregate_per_head_64)
+        && trace.aggregate_per_head_64.length > 0
+        && Array.isArray(trace.effective_head_gates)
+        && trace.effective_head_gates.length > 0
+      );
+      const hasContributionView = (
+        Array.isArray(trace.aggregate_contrib_64)
+        && trace.aggregate_contrib_64.length > 0
+      );
+      if (hasPerHeadRouter) {
+        options.push(["gate_weighted_router", "Gate-Weighted Router"]);
+      }
+      if (hasContributionView) {
+        options.push(["contribution_norm", "Contribution Norm"]);
+      }
+
+      const validValues = options.map(([value]) => value);
+      if (!validValues.includes(String(selectedAggregationMode))) {
+        selectedAggregationMode = validValues[0];
+      }
+      select.disabled = options.length <= 1;
+      select.innerHTML = options.map(([value, label]) => {
+        const selected = String(value) === String(selectedAggregationMode) ? "selected" : "";
+        return `<option value="${value}" ${selected}>${label}</option>`;
+      }).join("");
+    }
+
+    function routerTraceForSelection(trace) {
+      if (!trace) return trace;
+      if (selectedHead == null || String(selectedHead) === "all") {
+        return {
+          ...trace,
+          value_label: "router_mass",
+          view_mode_label: "Mean Router",
+        };
+      }
+      const headIndex = Number(selectedHead);
+      const usePerHead = (key) => Array.isArray(trace?.[key]) ? trace[key][headIndex] : null;
+      return {
+        ...trace,
+        aggregate_64: usePerHead("aggregate_per_head_64") || trace.aggregate_64,
+        csmp_64: usePerHead("csmp_per_head_64") || trace.csmp_64,
+        perceiver_64: usePerHead("perceiver_per_head_64") || trace.perceiver_64,
+        policy_64: usePerHead("policy_per_head_64") || trace.policy_64,
+        global_2: usePerHead("global_per_head_2") || trace.global_2,
+        value_label: "router_mass",
+        view_mode_label: "Mean Router",
+      };
+    }
+
+    function weightedAverageBoards(perHeadBoards, headWeights) {
+      if (!Array.isArray(perHeadBoards) || !perHeadBoards.length) {
+        return null;
+      }
+      const normalizedWeights = Array.isArray(headWeights)
+        ? headWeights.map((value) => Math.abs(Number(value || 0)))
+        : [];
+      const totalWeight = normalizedWeights.reduce((sum, value) => sum + value, 0);
+      if (!(totalWeight > 0)) {
+        return perHeadBoards[0].map((_value, index) => (
+          perHeadBoards.reduce((sum, board) => sum + Number(board[index] || 0), 0) / perHeadBoards.length
+        ));
+      }
+      return perHeadBoards[0].map((_value, index) => (
+        perHeadBoards.reduce(
+          (sum, board, headIndex) => sum + normalizedWeights[headIndex] * Number(board[index] || 0),
+          0,
+        ) / totalWeight
+      ));
+    }
+
+    function gateWeightedTraceForSelection(trace) {
+      if (!trace) return trace;
+      const routerTrace = routerTraceForSelection(trace);
+      if (selectedHead != null && String(selectedHead) !== "all") {
+        return {
+          ...routerTrace,
+          view_mode_label: "Gate-Weighted Router",
+          value_label: "gate_weighted_router_mass",
+        };
+      }
+      if (
+        (trace.router_mode || "shared") !== "per_head"
+        || !Array.isArray(trace.aggregate_per_head_64)
+        || !trace.aggregate_per_head_64.length
+      ) {
+        return {
+          ...routerTrace,
+          view_mode_label: "Gate-Weighted Router",
+          value_label: "gate_weighted_router_mass",
+        };
+      }
+
+      const headWeights = Array.isArray(trace.effective_head_gates) ? trace.effective_head_gates : [];
+      return {
+        ...trace,
+        aggregate_64: weightedAverageBoards(trace.aggregate_per_head_64, headWeights) || routerTrace.aggregate_64,
+        csmp_64: weightedAverageBoards(trace.csmp_per_head_64, headWeights) || routerTrace.csmp_64,
+        perceiver_64: weightedAverageBoards(trace.perceiver_per_head_64, headWeights) || routerTrace.perceiver_64,
+        policy_64: weightedAverageBoards(trace.policy_per_head_64, headWeights) || routerTrace.policy_64,
+        global_2: weightedAverageBoards(trace.global_per_head_2, headWeights) || routerTrace.global_2,
+        view_mode_label: "Gate-Weighted Router",
+        value_label: "gate_weighted_router_mass",
+      };
+    }
+
+    function contributionTraceForSelection(trace) {
+      if (!trace) return trace;
+      const routerTrace = routerTraceForSelection(trace);
+      if (selectedHead != null && String(selectedHead) !== "all") {
+        const headIndex = Number(selectedHead);
+        const usePerHead = (key) => Array.isArray(trace?.[key]) ? trace[key][headIndex] : null;
+        return {
+          ...trace,
+          aggregate_64: usePerHead("aggregate_contrib_per_head_64") || trace.aggregate_contrib_64 || routerTrace.aggregate_64,
+          csmp_64: usePerHead("csmp_contrib_per_head_64") || trace.csmp_contrib_64 || routerTrace.csmp_64,
+          perceiver_64: usePerHead("perceiver_contrib_per_head_64") || trace.perceiver_contrib_64 || routerTrace.perceiver_64,
+          policy_64: usePerHead("policy_contrib_per_head_64") || trace.policy_contrib_64 || routerTrace.policy_64,
+          global_2: usePerHead("global_contrib_per_head_2") || trace.global_contrib_2 || routerTrace.global_2,
+          view_mode_label: "Contribution Norm",
+          value_label: "contribution_mass",
+        };
+      }
+      return {
+        ...trace,
+        aggregate_64: trace.aggregate_contrib_64 || routerTrace.aggregate_64,
+        csmp_64: trace.csmp_contrib_64 || routerTrace.csmp_64,
+        perceiver_64: trace.perceiver_contrib_64 || routerTrace.perceiver_64,
+        policy_64: trace.policy_contrib_64 || routerTrace.policy_64,
+        global_2: trace.global_contrib_2 || routerTrace.global_2,
+        view_mode_label: "Contribution Norm",
+        value_label: "contribution_mass",
+      };
+    }
+
+    function traceBoardsForSelection(trace) {
+      if (selectedAggregationMode === "gate_weighted_router") {
+        return gateWeightedTraceForSelection(trace);
+      }
+      if (selectedAggregationMode === "contribution_norm") {
+        return contributionTraceForSelection(trace);
+      }
+      return routerTraceForSelection(trace);
     }
 
     function renderTracePanel() {
@@ -1005,26 +1238,55 @@ HTML_PAGE = """<!DOCTYPE html>
       if (!trace) {
         boardsEl.innerHTML = `<div class="empty">No trace is available for layer ${selectedLayer} yet.</div>`;
         metaEl.innerHTML = "";
+        syncAggregationOptions(null);
         return;
       }
 
+      syncHeadOptions(trace);
+      syncAggregationOptions(trace);
+      const visibleTrace = traceBoardsForSelection(trace);
+
       const sourceMass = [
-        (trace.csmp_64 || []).reduce((sum, value) => sum + value, 0),
-        (trace.perceiver_64 || []).reduce((sum, value) => sum + value, 0),
-        (trace.policy_64 || []).reduce((sum, value) => sum + value, 0),
+        (visibleTrace.csmp_64 || []).reduce((sum, value) => sum + value, 0),
+        (visibleTrace.perceiver_64 || []).reduce((sum, value) => sum + value, 0),
+        (visibleTrace.policy_64 || []).reduce((sum, value) => sum + value, 0),
       ];
-      const global = trace.global_2 || [0, 0];
+      const global = visibleTrace.global_2 || [0, 0];
+      const effectiveHeadGates = Array.isArray(trace.effective_head_gates) ? trace.effective_head_gates : [];
+      const tokenGateLogits = Array.isArray(trace.token_gate_logits) ? trace.token_gate_logits : [];
+      const routerMode = trace.router_mode || "shared";
+      const headMeta = (
+        selectedHead != null
+        && String(selectedHead) !== "all"
+        && Number(selectedHead) >= 0
+        && Number(selectedHead) < effectiveHeadGates.length
+      ) ? {
+        gate: Number(effectiveHeadGates[Number(selectedHead)] || 0),
+        tokenGate: Number(tokenGateLogits[Number(selectedHead)] || 0),
+      } : null;
+      const gateAbsMean = effectiveHeadGates.length
+        ? effectiveHeadGates.reduce((sum, value) => sum + Math.abs(Number(value || 0)), 0) / effectiveHeadGates.length
+        : 0;
+      const tokenGateMean = tokenGateLogits.length
+        ? tokenGateLogits.reduce((sum, value) => sum + Number(value || 0), 0) / tokenGateLogits.length
+        : 0;
 
       metaEl.innerHTML = `
+        <span><strong>Router</strong> ${routerMode}</span>
+        <span><strong>View</strong> ${visibleTrace.view_mode_label || "Mean Router"}</span>
         <span><strong>CSMP</strong> ${(sourceMass[0] * 100).toFixed(1)}%</span>
         <span><strong>Perceiver</strong> ${(sourceMass[1] * 100).toFixed(1)}%</span>
         <span><strong>Policy</strong> ${(sourceMass[2] * 100).toFixed(1)}%</span>
         <span><strong>Global P</strong> ${(Number(global[0] || 0) * 100).toFixed(1)}%</span>
         <span><strong>Side</strong> ${(Number(global[1] || 0) * 100).toFixed(1)}%</span>
+        <span><strong>Gate |mean|</strong> ${gateAbsMean.toFixed(3)}</span>
+        <span><strong>Token Gate Mean</strong> ${tokenGateMean.toFixed(3)}</span>
+        ${headMeta ? `<span><strong>Head Gate</strong> ${headMeta.gate.toFixed(3)}</span>` : ""}
+        ${headMeta ? `<span><strong>Head Token Gate</strong> ${headMeta.tokenGate.toFixed(3)}</span>` : ""}
       `;
 
       const boardSquares = session.board_squares || new Array(64).fill("");
-      boardsEl.innerHTML = boardLabels.map(([title, key]) => renderBoardCard(title, key, trace, boardSquares)).join("");
+      boardsEl.innerHTML = boardLabels.map(([title, key]) => renderBoardCard(title, key, visibleTrace, boardSquares)).join("");
     }
 
     function renderTopTokens() {
@@ -1147,6 +1409,14 @@ HTML_PAGE = """<!DOCTYPE html>
     });
     document.getElementById("layer-select").addEventListener("change", (event) => {
       selectedLayer = event.target.value;
+      renderTracePanel();
+    });
+    document.getElementById("head-select").addEventListener("change", (event) => {
+      selectedHead = event.target.value;
+      renderTracePanel();
+    });
+    document.getElementById("aggregation-select").addEventListener("change", (event) => {
+      selectedAggregationMode = event.target.value;
       renderTracePanel();
     });
 

@@ -108,3 +108,10 @@ All objective weights are configurable. Set weight to `0.0` to disable any head.
 | SPP | `spp_weight` | Predict attack counts and ray features |
 | Router sparsity | `structured_xattn_sparse_weight` | Keep decoder routing focused on few squares |
 | Router diversity | `structured_xattn_square_diversity_weight` | Prevent routing collapse to same squares |
+| Router gate usage | `structured_xattn_gate_usage_weight` | Keep token-conditioned chess injection from collapsing fully off |
+
+For structured fusion runs, the most important routing controls are usually:
+
+- `xattn_structured_router_mode`: `shared` keeps one square router per token; `per_head` lets each x-attn head pick its own squares.
+- `xattn_text_gate_mode`: `tanh_head` adds a token-conditioned per-head gate on top of the learned static head gates.
+- `structured_xattn_gate_usage_target`: sets the minimum average `|effective_gate|` encouraged by the weak hinge loss.
