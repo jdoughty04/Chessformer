@@ -114,4 +114,14 @@ For structured fusion runs, the most important routing controls are usually:
 
 - `xattn_structured_router_mode`: `shared` keeps one square router per token; `per_head` lets each x-attn head pick its own squares.
 - `xattn_text_gate_mode`: `tanh_head` adds a token-conditioned per-head gate on top of the learned static head gates.
+- `xattn_structured_use_engineered_source`: adds a fourth structured router source built from the `main` engineered square features.
 - `structured_xattn_gate_usage_target`: sets the minimum average `|effective_gate|` encouraged by the weak hinge loss.
+
+The current `main` engineered source is a `204`-dim per-square vector:
+
+- `64` one-hot square identity
+- `12` piece-type/color occupancy
+- `64` attacked-target bitmask
+- `64` defended-friendly-target bitmask
+
+If you use it as a grounding aid, the most promising follow-up feature upgrades are usually attacker/defender counts, pin/check indicators, legal-move participation, ray-blocker features, pawn-structure features, and a small separate global engineered token.

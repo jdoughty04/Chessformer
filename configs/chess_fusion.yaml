@@ -194,6 +194,7 @@ model:
     xattn_gate_init: 0.0           # initial gate value (0 = start with no chess signal)
     xattn_structured_router_mode: per_head   # shared = one 192-way router per token; per_head = independent router per x-attn head
     xattn_text_gate_mode: tanh_head        # tanh_head = per-token dynamic head gates from the router stem; none = static gates only
+    xattn_structured_use_engineered_source: false  # if true, add 204-dim main engineered square features as a fourth structured router source
     xattn_dropout: 0.1
     xattn_ffn_mult: 4
 

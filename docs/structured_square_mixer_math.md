@@ -6,7 +6,7 @@ This document gives the exact forward equations and routing regularizers for
 It covers:
 
 - the decoder-side routing equations
-- the $64 \times 3$ aligned slot construction
+- the $64 \times N_{\text{src}}$ aligned slot construction
 - the square-marginal sparsity loss
 - the square-diversity loss
 - the precise config / live-control scalars that weight these terms
@@ -21,8 +21,18 @@ For one decoder fusion layer, let:
 - $d_r$ = recurrent-query state size
 - $d_p$ = Perceiver latent size
 - $i \in \{0, \dots, 63\}$ = board-square index
-- $s \in \{\text{csmp}, \text{perc}, \text{pol}\}$ = square-aligned source index
+- $s \in \mathcal{S}$ = square-aligned source index
 - $k \in \{\text{perc\_global}, \text{side}\}$ = global-branch source index
+
+By default:
+
+- $\mathcal{S} = \{\text{csmp}, \text{perc}, \text{pol}\}$
+- $N_{\text{src}} = 3$
+
+If `xattn_structured_use_engineered_source: true`, then:
+
+- $\mathcal{S} = \{\text{csmp}, \text{perc}, \text{pol}, \text{eng}\}$
+- $N_{\text{src}} = 4$
 
 The layer receives:
 
@@ -30,8 +40,16 @@ The layer receives:
 - $x_i^{\text{csmp}} \in \mathbb{R}^{d_{\text{ctx}}}$: CSMP square token for square $i$
 - $x_i^{\text{perc}} \in \mathbb{R}^{d_p}$: Perceiver square latent for square $i$
 - $x_i^{\text{pol}} \in \mathbb{R}^{d_p}$: structured policy latent for square $i$
+- $x_i^{\text{eng}} \in \mathbb{R}^{204}$: optional engineered square feature vector
 - $g_b^{\text{perc}} \in \mathbb{R}^{d_p}$: Perceiver global latent
 - $g_b^{\text{side}} \in \mathbb{R}^{d_{\text{ctx}}}$: side-to-move token from pre-Perceiver context
+
+The current `main` engineered vector is:
+
+- `64` one-hot square-identity channels
+- `12` piece-type/color occupancy channels
+- `64` attacked-target bitmask channels for the piece on that square
+- `64` defended-friendly-target bitmask channels for the piece on that square
 
 The valid-text-token mask is:
 
@@ -57,7 +75,7 @@ where:
 
 ## 3. Slot-Weight Logits
 
-Each text token scores the $64 \times 3 = 192$ aligned square slots using the
+Each text token scores the $64 \times N_{\text{src}}$ aligned square slots using the
 concatenation of:
 
 - its text-side recurrent state $r_{b,t}$
@@ -72,7 +90,7 @@ $$
 Then the slot logits are:
 
 $$
-z_{b,t} = W_{\text{sq}} q_{b,t} + b_{\text{sq}} \in \mathbb{R}^{192}
+z_{b,t} = W_{\text{sq}} q_{b,t} + b_{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}
 $$
 
 The normalized slot weights are:
@@ -108,15 +126,16 @@ The square router, global router, and optional token-gate head all read from
 this same conditioning vector. That means the token decides both where to read
 chess information from and how strongly to inject it using the same context.
 
-## 5. Value Construction For The $64 \times 3$ Aligned Slots
+## 5. Value Construction For The $64 \times N_{\text{src}}$ Aligned Slots
 
 Each square source is projected into LLM space with a source-specific MLP:
 
 - $v_{b,i}^{\text{csmp}} = \text{MLP}_{\text{csmp}}(x_{b,i}^{\text{csmp}}) \in \mathbb{R}^{d_l}$
 - $v_{b,i}^{\text{perc}} = \text{MLP}_{\text{perc}}(x_{b,i}^{\text{perc}}) \in \mathbb{R}^{d_l}$
 - $v_{b,i}^{\text{pol}}  = \text{MLP}_{\text{pol}}(x_{b,i}^{\text{pol}}) \in \mathbb{R}^{d_l}$
+- if enabled, $v_{b,i}^{\text{eng}} = \text{LN+Linear}_{\text{eng}}(x_{b,i}^{\text{eng}}) \in \mathbb{R}^{d_l}$
 
-These are concatenated into one aligned slot table:
+These are concatenated into one aligned slot table. In the default 3-source case:
 
 $$
 V_b = [v_{b,0}^{\text{csmp}}, \dots, v_{b,63}^{\text{csmp}},
@@ -124,10 +143,23 @@ V_b = [v_{b,0}^{\text{csmp}}, \dots, v_{b,63}^{\text{csmp}},
        v_{b,0}^{\text{pol}},  \dots, v_{b,63}^{\text{pol}}] \in \mathbb{R}^{192 \times d_l}
 $$
 
+If the engineered source is enabled, the table simply appends the engineered block:
+
+$$
+V_b^{\text{eng}} = [V_b,
+       v_{b,0}^{\text{eng}}, \dots, v_{b,63}^{\text{eng}}] \in \mathbb{R}^{256 \times d_l}
+$$
+
+This engineered source is deliberately simple and square-local. If stronger
+groundedness is needed, the most natural extensions are attacker/defender
+counts by side or piece type, legal-move participation, pin/check indicators,
+ray-blocker structure, pawn-structure features, and a small separate global
+engineered token for facts that are awkward to express square-by-square.
+
 In `xattn_structured_router_mode: shared`, the square-router logits are:
 
 $$
-z_{b,t}^{\text{sq}} = W_{\text{sq}} c_{b,t} + b_{\text{sq}} \in \mathbb{R}^{192}
+z_{b,t}^{\text{sq}} = W_{\text{sq}} c_{b,t} + b_{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}
 $$
 
 $$
@@ -144,7 +176,7 @@ In `xattn_structured_router_mode: per_head`, each head gets its own square
 router:
 
 $$
-z_{b,t,h}^{\text{sq}} \in \mathbb{R}^{192}, \qquad
+z_{b,t,h}^{\text{sq}} \in \mathbb{R}^{64 N_{\text{src}}}, \qquad
 \alpha_{b,t,h} = \text{softmax}(z_{b,t,h}^{\text{sq}})
 $$
 
@@ -229,7 +261,7 @@ $$
 
 ## 8. Why The Routing Regularizer Is Square-Marginal
 
-The router distribution $\alpha_{b,t,s,i}$ is over $192$ slots, but the desired
+The router distribution $\alpha_{b,t,s,i}$ is over $64 N_{\text{src}}$ slots, but the desired
 inductive bias is:
 
 - sparse over board squares
@@ -415,7 +447,7 @@ diagnostics.
 
 ### Slot-level diagnostics
 
-These still describe the full $192$-way routing distribution:
+These still describe the full $64 N_{\text{src}}$-way routing distribution:
 
 - `slot_mean`
 - `slot_entropy`
@@ -495,7 +527,7 @@ The mapping is:
 - `Top-5 next tokens`
   - the current decoder softmax over next-token logits
 - `CSMP`, `Perceiver`, and `Policy` boards
-  - the three aligned source blocks inside the `192` slot distribution
+  - the aligned source blocks inside the `64 * N_src` slot distribution
 - `Aggregate` board
   - the source-marginalized square distribution
     $p_i^{sq} = \sum_s \alpha_{s,i}$

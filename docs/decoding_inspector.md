@@ -14,7 +14,7 @@ Use the inspector when you want to answer questions like:
 - which token the model currently wants to emit next
 - how peaked or uncertain the next-token distribution is
 - which squares a selected cross-attention layer used to produce the last token
-- whether a layer is reading more from CSMP, Perceiver, or Policy latents
+- whether a layer is reading more from CSMP, Perceiver, Policy, or optional Engineered features
 - whether a `per_head` router is specializing different x-attn heads differently
 - how large the token-conditioned effective chess gates are for the current token
 
@@ -29,7 +29,7 @@ The GUI currently supports only checkpoints that satisfy both conditions:
 - `model.chess_fusion.xattn_mode: structured_square_mixer`
 
 It fails fast on other checkpoint types because the square heatmaps rely on the
-structured `64 x 3` routing layout.
+structured square-router layout.
 
 ## Launching The GUI
 
@@ -106,12 +106,16 @@ text token processed in that decode step.
 
 ## Interpreting The Heatmaps
 
-The GUI shows four 64-square boards:
+The GUI always shows an `Aggregate` board plus one board per active square source.
+In the default configuration that means four 64-square boards:
 
 - `Aggregate`
 - `CSMP`
 - `Perceiver`
 - `Policy`
+
+If `xattn_structured_use_engineered_source: true`, a fifth `Engineered` board
+appears.
 
 Squares are rendered in normal chess orientation with White at the bottom.
 Internally, square index `0` is `a1`, matching `python-chess`.
@@ -139,27 +143,38 @@ the interpretation depends on the selected `View`:
 
 ### Source Boards
 
-The three source boards split that aggregate mass by aligned source type:
+The source boards split that aggregate mass by aligned source type:
 
 - `CSMP`: routing to the message-passing square tokens
 - `Perceiver`: routing to the Perceiver square latents
 - `Policy`: routing to the structured policy latents
+- `Engineered` when enabled: routing to the `204`-dim `main` engineered square features
 
-For a selected square, these three values sum to that square's aggregate mass.
+Those engineered features are currently:
 
-The source order is fixed everywhere in the inspector:
+- `64` one-hot square-identity channels
+- `12` piece-type/color occupancy channels
+- `64` attacked-target bitmask channels
+- `64` defended-friendly-target bitmask channels
+
+For a selected square, the source-board values sum to that square's aggregate mass.
+
+The source order is:
 
 1. `CSMP`
 2. `Perceiver`
 3. `Policy`
+4. `Engineered` when enabled
 
 ### Raw Slot Weights
 
-Under the hood, the structured mixer routes over `192` aligned slots:
+Under the hood, the structured mixer routes over aligned slots grouped in `64`
+square blocks:
 
 - `64` CSMP square slots
 - `64` Perceiver square slots
 - `64` Policy square slots
+- `64` Engineered square slots when enabled
 
 With `xattn_structured_router_mode: per_head`, each head gets its own `192`-way
 router and its own `2`-way global router. Individual head selection always
@@ -184,18 +199,7 @@ The trace metadata row now also shows:
 - mean token-gate logit over heads
 - when a single head is selected, that head's effective gate and token-gate logit
 
-## How One Decode Step Maps To The Model
 
-For each decode step:
-
-1. The prompt, FEN features, prefix embeddings, masks, and chess context are prepared.
-2. The model computes the next-token logits.
-3. The selected token is committed, either greedily or from a clicked top-5 choice.
-4. The inspector captures the chosen fusion layer traces for the last valid token only.
-5. The UI updates the text, top-5 distribution, and square heatmaps.
-
-Only the current step's last-token trace is stored. The inspector does not keep
-a full history of all layer traces across the entire generation.
 
 ## What The GUI Is Not Showing
 
@@ -216,6 +220,7 @@ The inspector is the visual counterpart to
 
 - top-5 next tokens come from the current decoder logits
 - `CSMP`, `Perceiver`, and `Policy` boards correspond to the three aligned slot groups
+- the optional `Engineered` board corresponds to the engineered-feature slot group
 - `Aggregate` corresponds to the source-marginalized 64-square distribution
 - the head selector lets you switch between the mean-over-heads view and
   individual head routing when available

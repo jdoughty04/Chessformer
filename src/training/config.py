@@ -150,6 +150,7 @@ class ChessFusionConfig:
     xattn_gate_init: float = 0.0         # tanh gate init value (0 = identity at start)
     xattn_structured_router_mode: Literal["shared", "per_head"] = "shared"  # structured mixer: shared slot router or independent per-head routers
     xattn_text_gate_mode: Literal["none", "tanh_head"] = "tanh_head"  # structured mixer only: optional token-conditioned per-head tanh gate logits
+    xattn_structured_use_engineered_source: bool = False  # structured mixer only: add main engineered square features as a fourth router source
     xattn_dropout: float = 0.1           # Dropout in xattn attention + FFN
     xattn_ffn_mult: int = 2              # FFN expansion multiplier in xattn (2x instead of 4x)
     xattn_recurrent_query_state_dim: int = 256 # GRU hidden size for recurrent-query state used by both fusion modes

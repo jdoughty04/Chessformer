@@ -798,9 +798,16 @@ class ChessCommentaryModel(nn.Module):
                 raise ValueError("maia_features must be provided when mode='chess_fusion'")
             maia_features = maia_features.to(adapter_device)
             fusion_kwargs = {'side_to_move': side_to_move}
-            if getattr(self.config.chess_fusion, "use_engineered_concat", False):
+            needs_main_engineered_features = (
+                getattr(self.config.chess_fusion, "use_engineered_concat", False)
+                or getattr(self.config.chess_fusion, "xattn_structured_use_engineered_source", False)
+            )
+            if needs_main_engineered_features:
                 if engineered_features is None:
-                    raise ValueError("engineered_features required for chess_fusion with use_engineered_concat")
+                    raise ValueError(
+                        "engineered_features required for chess_fusion when "
+                        "use_engineered_concat or xattn_structured_use_engineered_source is enabled"
+                    )
                 fusion_kwargs['engineered_features'] = engineered_features.to(adapter_device)
             if maia_policy is not None:
                 fusion_kwargs['precomputed_policy'] = maia_policy
@@ -842,6 +849,9 @@ class ChessCommentaryModel(nn.Module):
             csmp_square_tokens = adapter_out.get('csmp_square_tokens', None)
             if csmp_square_tokens is not None:
                 csmp_square_tokens = csmp_square_tokens.to(dtype=self.torch_dtype)
+            engineered_square_features = adapter_out.get('engineered_square_features', None)
+            if engineered_square_features is not None:
+                engineered_square_features = engineered_square_features.to(dtype=self.torch_dtype)
             prepend_embeddings = adapter_out.get('prepend_embeddings', None)
             if prepend_embeddings is not None:
                 if prepend_embeddings.size(1) != self.num_prefix_tokens:
@@ -964,6 +974,7 @@ class ChessCommentaryModel(nn.Module):
                 csmp_square_tokens=csmp_square_tokens,
                 text_attention_mask=combined_mask,
                 policy_latents=policy_latents,
+                engineered_square_features=engineered_square_features,
             )
         
         # 7. Extend labels if provided (use -100 for prefix and FEN - no loss)
@@ -1205,7 +1216,10 @@ class ChessCommentaryModel(nn.Module):
             fusion_kwargs = {"side_to_move": side_tensor}
             if maia_policy is not None:
                 fusion_kwargs["precomputed_policy"] = maia_policy.to(device)
-            if getattr(self.config.chess_fusion, "use_engineered_concat", False):
+            if (
+                getattr(self.config.chess_fusion, "use_engineered_concat", False)
+                or getattr(self.config.chess_fusion, "xattn_structured_use_engineered_source", False)
+            ):
                 engineered = extract_engineered_features(fen, mode="main").unsqueeze(0).to(device)
                 fusion_kwargs["engineered_features"] = engineered
             adapter_out = self.adapter(features, **fusion_kwargs)
@@ -1220,11 +1234,15 @@ class ChessCommentaryModel(nn.Module):
                 csmp_square_tokens = csmp_square_tokens.to(dtype=self.torch_dtype)
             if policy_latents is not None:
                 policy_latents = policy_latents.to(dtype=self.torch_dtype)
+            engineered_square_features = adapter_out.get("engineered_square_features", None)
+            if engineered_square_features is not None:
+                engineered_square_features = engineered_square_features.to(dtype=self.torch_dtype)
             generation_context = {
                 "perceiver_latents": perceiver_latents.to(dtype=self.torch_dtype),
                 "context": ctx,
                 "csmp_square_tokens": csmp_square_tokens,
                 "policy_latents": policy_latents,
+                "engineered_square_features": engineered_square_features,
             }
             prepend_embeddings = adapter_out.get("prepend_embeddings", None)
             if prepend_embeddings is not None:
@@ -1348,6 +1366,7 @@ class ChessCommentaryModel(nn.Module):
             csmp_square_tokens=generation_context.get("csmp_square_tokens"),
             text_attention_mask=text_attention_mask,
             policy_latents=generation_context.get("policy_latents"),
+            engineered_square_features=generation_context.get("engineered_square_features"),
         )
 
     def clear_generation_context(self) -> None:
@@ -2276,6 +2295,7 @@ class ChessCommentaryTrainingDataset(Dataset):
         feature_mode: str = "simplified",
         use_perceiver_main_engineered_concat: bool = False,
         use_maia_main_engineered_concat: bool = False,
+        use_chess_fusion_main_engineered_source: bool = False,
         preload: bool = False,
         use_last_move_in_prompt: bool = False,
         use_pgn_in_prompt: bool = False,
@@ -2300,6 +2320,7 @@ class ChessCommentaryTrainingDataset(Dataset):
         self.feature_mode = feature_mode
         self.use_perceiver_main_engineered_concat = use_perceiver_main_engineered_concat
         self.use_maia_main_engineered_concat = use_maia_main_engineered_concat
+        self.use_chess_fusion_main_engineered_source = use_chess_fusion_main_engineered_source
         self.use_last_move_in_prompt = use_last_move_in_prompt
         self.use_pgn_in_prompt = use_pgn_in_prompt
         self.prepend_fen_in_prompt = prepend_fen_in_prompt
@@ -2312,6 +2333,8 @@ class ChessCommentaryTrainingDataset(Dataset):
         self._print_supervision_probe()
         if use_engineered_features:
             print("  [Engineered features] Pre-computing features during data loading")
+        if use_chess_fusion_main_engineered_source:
+            print("  [Structured engineered source] Pre-computing main engineered square features")
         if use_last_move_in_prompt:
             print("  [Last move] Including last move in prompt when available")
         if use_pgn_in_prompt:
@@ -2545,6 +2568,8 @@ class ChessCommentaryTrainingDataset(Dataset):
         if self.use_maia_features and fen:
             maia_features = extract_maia_features(fen)
             if self.use_maia_main_engineered_concat and engineered_features is None:
+                engineered_features = extract_engineered_features(fen, mode="main")
+            if self.use_chess_fusion_main_engineered_source and engineered_features is None:
                 engineered_features = extract_engineered_features(fen, mode="main")
         
         # Build prompt text (may vary per-sample when PGN/last_move is included)
@@ -3348,6 +3373,10 @@ def train(config: TrainingConfig):
                 getattr(config.model.maia, "use_main_engineered_concat", False)
                 or (config.model.mode == "chess_fusion" and getattr(config.model.chess_fusion, "use_engineered_concat", False))
             ),
+            use_chess_fusion_main_engineered_source=(
+                config.model.mode == "chess_fusion"
+                and getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
+            ),
             preload=config.preload_dataset,
             use_last_move_in_prompt=config.use_last_move_in_prompt,
             use_pgn_in_prompt=config.use_pgn_in_prompt,
@@ -3390,6 +3419,10 @@ def train(config: TrainingConfig):
                 use_maia_main_engineered_concat=(
                     getattr(config.model.maia, "use_main_engineered_concat", False)
                     or (config.model.mode == "chess_fusion" and getattr(config.model.chess_fusion, "use_engineered_concat", False))
+                ),
+                use_chess_fusion_main_engineered_source=(
+                    config.model.mode == "chess_fusion"
+                    and getattr(config.model.chess_fusion, "xattn_structured_use_engineered_source", False)
                 ),
                 preload=config.preload_dataset,
                 use_last_move_in_prompt=config.use_last_move_in_prompt,

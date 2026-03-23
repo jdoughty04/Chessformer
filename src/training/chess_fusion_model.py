@@ -2121,6 +2121,7 @@ class GatedCrossAttention(nn.Module):
         llm_dim: int = 2048,
         perceiver_dim: int = 1280,
         context_dim: int = 256,
+        engineered_dim: int = 204,
         num_fusion_tokens: int = 16,
         n_heads: int = 8,
         ffn_mult: int = 2,
@@ -2132,11 +2133,13 @@ class GatedCrossAttention(nn.Module):
         xattn_mode: str = "recurrent_query_attn",
         structured_router_mode: str = "shared",
         text_gate_mode: str = "tanh_head",
+        use_engineered_source: bool = False,
     ):
         super().__init__()
         gate_init = float(gate_init)
         self.llm_dim = llm_dim
         self.context_dim = int(context_dim)
+        self.engineered_dim = int(engineered_dim)
         self.n_heads = n_heads
         self.head_dim = llm_dim // n_heads
         self.num_fusion_tokens = int(num_fusion_tokens)
@@ -2145,6 +2148,13 @@ class GatedCrossAttention(nn.Module):
         self.xattn_mode = str(xattn_mode)
         self.structured_router_mode = str(structured_router_mode)
         self.text_gate_mode = str(text_gate_mode)
+        self.use_engineered_source = bool(use_engineered_source)
+        self.structured_square_source_names: Tuple[str, ...] = (
+            ("csmp", "perceiver", "policy", "engineered")
+            if self.use_engineered_source
+            else ("csmp", "perceiver", "policy")
+        )
+        self.structured_square_source_count = len(self.structured_square_source_names)
         self._shared_recurrent_query_gru_ref: Optional[weakref.ReferenceType] = None
         assert llm_dim % n_heads == 0, f"llm_dim {llm_dim} not divisible by n_heads {n_heads}"
         if self.xattn_mode not in {"recurrent_query_attn", "structured_square_mixer"}:
@@ -2237,6 +2247,7 @@ class GatedCrossAttention(nn.Module):
             self.structured_csmp_square_mlp = None
             self.structured_perceiver_square_mlp = None
             self.structured_policy_square_mlp = None
+            self.structured_engineered_square_proj = None
             self.structured_global_perceiver_mlp = None
             self.structured_global_side_mlp = None
             self.structured_router_stem = None
@@ -2261,13 +2272,18 @@ class GatedCrossAttention(nn.Module):
             self.structured_csmp_square_mlp = self._build_source_value_mlp(self.context_dim, dropout)
             self.structured_perceiver_square_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
             self.structured_policy_square_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
+            self.structured_engineered_square_proj = (
+                self._build_engineered_value_proj(self.engineered_dim)
+                if self.use_engineered_source
+                else None
+            )
             self.structured_global_perceiver_mlp = self._build_source_value_mlp(perceiver_dim, dropout)
             self.structured_global_side_mlp = self._build_source_value_mlp(self.context_dim, dropout)
             self.structured_router_stem = self._build_router_stem(
                 self.recurrent_query_state_dim + perceiver_dim,
                 dropout,
             )
-            square_router_dim = 64 * 3
+            square_router_dim = 64 * self.structured_square_source_count
             global_router_dim = 2
             if self.structured_router_mode == "per_head":
                 square_router_dim *= self.n_heads
@@ -2325,6 +2341,12 @@ class GatedCrossAttention(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.llm_dim, self.llm_dim),
+        )
+
+    def _build_engineered_value_proj(self, input_dim: int) -> nn.Module:
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, self.llm_dim),
         )
 
     def _build_router_stem(self, input_dim: int, dropout: float) -> nn.Module:
@@ -2463,14 +2485,18 @@ class GatedCrossAttention(nn.Module):
         slot_entropy = (
             -(slot_probs * slot_probs.log()).sum(dim=-1) * valid_f.unsqueeze(-1)
         ).sum() / denom_per_head
-        source_mass_per_head = slot_mean_per_head.view(router_heads, 3, 64).sum(dim=-1)
+        source_mass_per_head = slot_mean_per_head.view(
+            router_heads,
+            self.structured_square_source_count,
+            64,
+        ).sum(dim=-1)
         source_mass = source_mass_per_head.mean(dim=0)
 
         square_weights_per_head = slot_weights_per_head.view(
             slot_weights_per_head.size(0),
             slot_weights_per_head.size(1),
             router_heads,
-            3,
+            self.structured_square_source_count,
             64,
         ).sum(dim=3)
         square_mean_per_head = (
@@ -2600,6 +2626,7 @@ class GatedCrossAttention(nn.Module):
 
         trace: Dict[str, Any] = {
             "router_mode": self.structured_router_mode,
+            "source_labels": self.structured_square_source_names,
             "effective_head_gates": selected_effective_gates,
             "last_token_indices": last_token_indices.detach(),
         }
@@ -2621,7 +2648,11 @@ class GatedCrossAttention(nn.Module):
         if slot_weights.dim() == 3:
             raw_slot_weights = slot_weights[batch_indices, last_token_indices].detach()
             global_token_weights = global_weights[batch_indices, last_token_indices].detach()
-            source_square_weights = raw_slot_weights.view(batch_size, 3, 64)
+            source_square_weights = raw_slot_weights.view(
+                batch_size,
+                self.structured_square_source_count,
+                64,
+            )
             aggregate_square_weights = source_square_weights.sum(dim=1)
             head_square_weights = raw_slot_weights.unsqueeze(1).expand(-1, self.n_heads, -1)
             head_global_weights = global_token_weights.unsqueeze(1).expand(-1, self.n_heads, -1)
@@ -2636,7 +2667,12 @@ class GatedCrossAttention(nn.Module):
         else:
             raw_slot_weights_per_head = slot_weights[batch_indices, last_token_indices].detach()
             global_weights_per_head = global_weights[batch_indices, last_token_indices].detach()
-            source_square_weights_per_head = raw_slot_weights_per_head.view(batch_size, self.n_heads, 3, 64)
+            source_square_weights_per_head = raw_slot_weights_per_head.view(
+                batch_size,
+                self.n_heads,
+                self.structured_square_source_count,
+                64,
+            )
             aggregate_square_weights_per_head = source_square_weights_per_head.sum(dim=2)
             head_square_weights = raw_slot_weights_per_head
             head_global_weights = global_weights_per_head
@@ -2662,7 +2698,13 @@ class GatedCrossAttention(nn.Module):
             gate_scale
             * head_square_weights_f.unsqueeze(-1)
             * square_values_projected[batch_indices]
-        ).view(batch_size, self.n_heads, 3, 64, self.llm_dim)
+        ).view(
+            batch_size,
+            self.n_heads,
+            self.structured_square_source_count,
+            64,
+            self.llm_dim,
+        )
         global_contrib_vectors_per_head = (
             gate_scale
             * head_global_weights_f.unsqueeze(-1)
@@ -2823,6 +2865,7 @@ class GatedCrossAttention(nn.Module):
         csmp_square_tokens: Optional[torch.Tensor],
         text_attention_mask: Optional[torch.Tensor],
         policy_latents: Optional[torch.Tensor],
+        engineered_square_features: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if (
             self.structured_router_stem is None
@@ -2856,6 +2899,14 @@ class GatedCrossAttention(nn.Module):
         self._require_square_count("csmp_square_tokens", csmp_square_tokens, expected=64)
         self._require_rank3("policy_latents", policy_latents)
         self._require_square_count("policy_latents", policy_latents, expected=64)
+        if self.use_engineered_source:
+            if engineered_square_features is None:
+                raise ValueError(
+                    "structured_square_mixer with use_engineered_source=True "
+                    "requires engineered_square_features"
+                )
+            self._require_rank3("engineered_square_features", engineered_square_features)
+            self._require_square_count("engineered_square_features", engineered_square_features, expected=64)
 
         B, S, _ = hidden_states.shape
         rq_in = self.recurrent_query_norm(hidden_states)
@@ -2877,14 +2928,18 @@ class GatedCrossAttention(nn.Module):
         else:
             token_gate_logits = None
 
-        square_values = torch.cat(
-            [
-                self.structured_csmp_square_mlp(csmp_square_tokens),
-                self.structured_perceiver_square_mlp(perceiver_latents[:, :64, :]),
-                self.structured_policy_square_mlp(policy_latents),
-            ],
-            dim=1,
-        )  # (B, 192, llm_dim)
+        square_value_parts = [
+            self.structured_csmp_square_mlp(csmp_square_tokens),
+            self.structured_perceiver_square_mlp(perceiver_latents[:, :64, :]),
+            self.structured_policy_square_mlp(policy_latents),
+        ]
+        if self.use_engineered_source:
+            if self.structured_engineered_square_proj is None:
+                raise RuntimeError("structured engineered square source is not initialized.")
+            square_value_parts.append(
+                self.structured_engineered_square_proj(engineered_square_features)
+            )
+        square_values = torch.cat(square_value_parts, dim=1)
         square_values_heads = self._reshape_values_to_heads(square_values)
 
         global_values = torch.stack(
@@ -2897,7 +2952,7 @@ class GatedCrossAttention(nn.Module):
         global_values_heads = self._reshape_values_to_heads(global_values)
 
         if self.structured_router_mode == "per_head":
-            square_logits = square_logits.view(B, S, self.n_heads, 64 * 3)
+            square_logits = square_logits.view(B, S, self.n_heads, 64 * self.structured_square_source_count)
             square_weights = torch.softmax(square_logits.float(), dim=-1).to(dtype=hidden_states.dtype)
             square_mix = torch.einsum("bshn,bnhd->bshd", square_weights, square_values_heads)
 
@@ -2957,6 +3012,7 @@ class GatedCrossAttention(nn.Module):
         csmp_square_tokens: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
         policy_latents: Optional[torch.Tensor] = None,
+        engineered_square_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -2977,6 +3033,7 @@ class GatedCrossAttention(nn.Module):
                 csmp_square_tokens=csmp_square_tokens,
                 text_attention_mask=text_attention_mask,
                 policy_latents=policy_latents,
+                engineered_square_features=engineered_square_features,
             )
 
         self._last_structured_metrics = None
@@ -3264,17 +3321,20 @@ class FusionDecoderLayer(nn.Module):
         self._csmp_square_tokens: Optional[torch.Tensor] = None
         self._text_attention_mask: Optional[torch.Tensor] = None
         self._policy_latents: Optional[torch.Tensor] = None
+        self._engineered_square_features: Optional[torch.Tensor] = None
 
     def set_chess_context(self, perceiver_latents: torch.Tensor,
                           context: Optional[torch.Tensor] = None,
                           csmp_square_tokens: Optional[torch.Tensor] = None,
                           text_attention_mask: Optional[torch.Tensor] = None,
-                          policy_latents: Optional[torch.Tensor] = None):
+                          policy_latents: Optional[torch.Tensor] = None,
+                          engineered_square_features: Optional[torch.Tensor] = None):
         self._perceiver_latents = perceiver_latents
         self._context = context
         self._csmp_square_tokens = csmp_square_tokens
         self._text_attention_mask = text_attention_mask
         self._policy_latents = policy_latents
+        self._engineered_square_features = engineered_square_features
 
     def clear_chess_context(self):
         self._perceiver_latents = None
@@ -3282,6 +3342,7 @@ class FusionDecoderLayer(nn.Module):
         self._csmp_square_tokens = None
         self._text_attention_mask = None
         self._policy_latents = None
+        self._engineered_square_features = None
 
     # Class-level profiling accumulators (reset per LLM forward by training loop).
     # Stored as lists (one entry per fusion layer call) to enable per-layer breakdown.
@@ -3333,6 +3394,7 @@ class FusionDecoderLayer(nn.Module):
                     self._csmp_square_tokens,
                     self._text_attention_mask,
                     self._policy_latents,
+                    self._engineered_square_features,
                 )
                 outputs = (hidden_states,) + outputs[1:]
             else:
@@ -3343,6 +3405,7 @@ class FusionDecoderLayer(nn.Module):
                     self._csmp_square_tokens,
                     self._text_attention_mask,
                     self._policy_latents,
+                    self._engineered_square_features,
                 )
 
         if _p:
@@ -3411,6 +3474,9 @@ class ChessFusionAdapter(nn.Module):
         self.xattn_mode = str(getattr(cfg, 'xattn_mode', 'recurrent_query_attn'))
         self.xattn_structured_router_mode = str(getattr(cfg, 'xattn_structured_router_mode', 'shared'))
         self.xattn_text_gate_mode = str(getattr(cfg, 'xattn_text_gate_mode', 'tanh_head'))
+        self.xattn_structured_use_engineered_source = bool(
+            getattr(cfg, 'xattn_structured_use_engineered_source', False)
+        )
         self.xattn_recurrent_query_share_gru_across_layers = bool(
             getattr(cfg, 'xattn_recurrent_query_share_gru_across_layers', False)
         )
@@ -3484,6 +3550,11 @@ class ChessFusionAdapter(nn.Module):
                 "chess_fusion.xattn_text_gate_mode must be one of "
                 "{'none', 'tanh_head'} "
                 f"(got {self.xattn_text_gate_mode!r})"
+            )
+        if self.xattn_structured_use_engineered_source and self.xattn_mode != 'structured_square_mixer':
+            raise ValueError(
+                "chess_fusion.xattn_structured_use_engineered_source=True requires "
+                "xattn_mode='structured_square_mixer'"
             )
         if self.xattn_mode == 'structured_square_mixer':
             if not self.structured_latents:
@@ -3661,6 +3732,7 @@ class ChessFusionAdapter(nn.Module):
                 xattn_mode=self.xattn_mode,
                 structured_router_mode=self.xattn_structured_router_mode,
                 text_gate_mode=self.xattn_text_gate_mode,
+                use_engineered_source=self.xattn_structured_use_engineered_source,
             )
             for _ in self.xattn_layer_indices
         ])
@@ -3744,7 +3816,8 @@ class ChessFusionAdapter(nn.Module):
         if self.xattn_mode == "structured_square_mixer":
             print(
                 f"  Structured router: mode={self.xattn_structured_router_mode}, "
-                f"text_gate_mode={self.xattn_text_gate_mode}"
+                f"text_gate_mode={self.xattn_text_gate_mode}, "
+                f"engineered_source={self.xattn_structured_use_engineered_source}"
             )
         if self.shared_readout is not None:
             print(f"  Fusion tokens: {self.cfg.num_fusion_tokens} per xattn layer (policy_latent_cond={bool(getattr(self.cfg, 'readout_use_policy_latent_cross_attention', False))})")
@@ -4006,6 +4079,7 @@ class ChessFusionAdapter(nn.Module):
         csmp_square_tokens: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
         policy_latents: Optional[torch.Tensor] = None,
+        engineered_square_features: Optional[torch.Tensor] = None,
     ):
         """Set Perceiver latents (and optionally pre-Perceiver context) on all fusion decoder layers."""
         for layer in self._fusion_layers:
@@ -4015,6 +4089,7 @@ class ChessFusionAdapter(nn.Module):
                 csmp_square_tokens=csmp_square_tokens,
                 text_attention_mask=text_attention_mask,
                 policy_latents=policy_latents,
+                engineered_square_features=engineered_square_features,
             )
 
     def clear_chess_context(self):
@@ -4113,7 +4188,6 @@ class ChessFusionAdapter(nn.Module):
     @torch.no_grad()
     def get_structured_xattn_metrics(self) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
-        source_names = ("csmp", "perceiver", "policy")
         global_source_names = ("perceiver_global", "side_token")
 
         for i, idx in enumerate(self.xattn_layer_indices):
@@ -4121,6 +4195,7 @@ class ChessFusionAdapter(nn.Module):
             structured = getattr(xattn, "_last_structured_metrics", None)
             if xattn.xattn_mode != "structured_square_mixer" or structured is None:
                 continue
+            source_names = tuple(getattr(xattn, "structured_square_source_names", ("csmp", "perceiver", "policy")))
 
             slot_mean = structured["slot_mean"].detach().float().cpu()
             slot_mean_per_head = structured["slot_mean_per_head"].detach().float().cpu()
@@ -4228,6 +4303,7 @@ class ChessFusionAdapter(nn.Module):
             source_square_weights = (
                 trace["source_square_weights"][sample_index].detach().float().cpu()
             )
+            source_labels = tuple(trace.get("source_labels", getattr(xattn, "structured_square_source_names", ("csmp", "perceiver", "policy"))))
             trace_dict: Dict[str, Any] = {
                 "raw_slot_weights": trace["raw_slot_weights"][sample_index].detach().float().cpu(),
                 "source_square_weights": source_square_weights,
@@ -4236,10 +4312,16 @@ class ChessFusionAdapter(nn.Module):
                 ),
                 "global_weights": trace["global_weights"][sample_index].detach().float().cpu(),
                 "last_token_index": trace["last_token_indices"][sample_index].detach().cpu(),
-                "csmp_square_weights": source_square_weights[0].clone(),
-                "perceiver_square_weights": source_square_weights[1].clone(),
-                "policy_square_weights": source_square_weights[2].clone(),
+                "source_labels": list(source_labels),
             }
+            for source_idx, source_name in enumerate(source_labels):
+                trace_dict[f"{source_name}_square_weights"] = source_square_weights[source_idx].clone()
+            if len(source_labels) >= 1:
+                trace_dict["csmp_square_weights"] = source_square_weights[0].clone()
+            if len(source_labels) >= 2:
+                trace_dict["perceiver_square_weights"] = source_square_weights[1].clone()
+            if len(source_labels) >= 3:
+                trace_dict["policy_square_weights"] = source_square_weights[2].clone()
             if "effective_head_gates" in trace:
                 trace_dict["effective_head_gates"] = (
                     trace["effective_head_gates"][sample_index].detach().float().cpu()
@@ -4259,9 +4341,16 @@ class ChessFusionAdapter(nn.Module):
                 trace_dict["global_contribution_norms"] = (
                     trace["global_contribution_norms"][sample_index].detach().float().cpu()
                 )
-                trace_dict["csmp_square_contribution_norms"] = contribution_norms[0].clone()
-                trace_dict["perceiver_square_contribution_norms"] = contribution_norms[1].clone()
-                trace_dict["policy_square_contribution_norms"] = contribution_norms[2].clone()
+                for source_idx, source_name in enumerate(source_labels):
+                    trace_dict[f"{source_name}_square_contribution_norms"] = (
+                        contribution_norms[source_idx].clone()
+                    )
+                if len(source_labels) >= 1:
+                    trace_dict["csmp_square_contribution_norms"] = contribution_norms[0].clone()
+                if len(source_labels) >= 2:
+                    trace_dict["perceiver_square_contribution_norms"] = contribution_norms[1].clone()
+                if len(source_labels) >= 3:
+                    trace_dict["policy_square_contribution_norms"] = contribution_norms[2].clone()
             if "raw_slot_weights_per_head" in trace:
                 per_head_source_square_weights = (
                     trace["source_square_weights_per_head"][sample_index].detach().float().cpu()
@@ -4276,9 +4365,16 @@ class ChessFusionAdapter(nn.Module):
                 trace_dict["global_weights_per_head"] = (
                     trace["global_weights_per_head"][sample_index].detach().float().cpu()
                 )
-                trace_dict["csmp_square_weights_per_head"] = per_head_source_square_weights[:, 0].clone()
-                trace_dict["perceiver_square_weights_per_head"] = per_head_source_square_weights[:, 1].clone()
-                trace_dict["policy_square_weights_per_head"] = per_head_source_square_weights[:, 2].clone()
+                for source_idx, source_name in enumerate(source_labels):
+                    trace_dict[f"{source_name}_square_weights_per_head"] = (
+                        per_head_source_square_weights[:, source_idx].clone()
+                    )
+                if len(source_labels) >= 1:
+                    trace_dict["csmp_square_weights_per_head"] = per_head_source_square_weights[:, 0].clone()
+                if len(source_labels) >= 2:
+                    trace_dict["perceiver_square_weights_per_head"] = per_head_source_square_weights[:, 1].clone()
+                if len(source_labels) >= 3:
+                    trace_dict["policy_square_weights_per_head"] = per_head_source_square_weights[:, 2].clone()
             if "source_square_contribution_norms_per_head" in trace:
                 per_head_contribution_norms = (
                     trace["source_square_contribution_norms_per_head"][sample_index].detach().float().cpu()
@@ -4290,15 +4386,22 @@ class ChessFusionAdapter(nn.Module):
                 trace_dict["global_contribution_norms_per_head"] = (
                     trace["global_contribution_norms_per_head"][sample_index].detach().float().cpu()
                 )
-                trace_dict["csmp_square_contribution_norms_per_head"] = (
-                    per_head_contribution_norms[:, 0].clone()
-                )
-                trace_dict["perceiver_square_contribution_norms_per_head"] = (
-                    per_head_contribution_norms[:, 1].clone()
-                )
-                trace_dict["policy_square_contribution_norms_per_head"] = (
-                    per_head_contribution_norms[:, 2].clone()
-                )
+                for source_idx, source_name in enumerate(source_labels):
+                    trace_dict[f"{source_name}_square_contribution_norms_per_head"] = (
+                        per_head_contribution_norms[:, source_idx].clone()
+                    )
+                if len(source_labels) >= 1:
+                    trace_dict["csmp_square_contribution_norms_per_head"] = (
+                        per_head_contribution_norms[:, 0].clone()
+                    )
+                if len(source_labels) >= 2:
+                    trace_dict["perceiver_square_contribution_norms_per_head"] = (
+                        per_head_contribution_norms[:, 1].clone()
+                    )
+                if len(source_labels) >= 3:
+                    trace_dict["policy_square_contribution_norms_per_head"] = (
+                        per_head_contribution_norms[:, 2].clone()
+                    )
             trace_dict["router_mode"] = trace["router_mode"]
             traces[idx] = trace_dict
 
@@ -4444,6 +4547,11 @@ class ChessFusionAdapter(nn.Module):
 
         # Perceiver â€” returns shared latents (each xattn layer reads them independently)
         engineered_features = kwargs.get('engineered_features', None)
+        if self.xattn_structured_use_engineered_source and engineered_features is None:
+            raise ValueError(
+                "engineered_features required when "
+                "xattn_structured_use_engineered_source=True"
+            )
         self.perceiver._profile = bool(_profile)
         (
             latents,
@@ -4516,6 +4624,8 @@ class ChessFusionAdapter(nn.Module):
             'move_eval_mse_logits': move_eval_mse_logits,
             'move_mate_logits': move_mate_logits,
         }
+        if self.xattn_structured_use_engineered_source and engineered_features is not None:
+            result['engineered_square_features'] = engineered_features
 
         # --- BSR / SPP auxiliary heads (run only when weight > 0) ---
         target_boards = abs_boards if abs_boards is not None else boards

@@ -64,6 +64,7 @@ def _make_inputs(
         "context": torch.randn(batch_size, 65, context_dim),
         "csmp_square_tokens": torch.randn(batch_size, 64, context_dim),
         "policy_latents": torch.randn(batch_size, 64, perceiver_dim),
+        "engineered_square_features": torch.randn(batch_size, 64, 204),
         "text_attention_mask": torch.tensor(
             [[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]],
             dtype=torch.long,
@@ -118,9 +119,10 @@ def test_fusion_decoder_layer_calls_xattn_positionally():
     assert isinstance(outputs, tuple)
     assert outputs[0].shape == inputs["hidden_states"].shape
     assert xattn.last_args is not None
-    assert len(xattn.last_args) == 6
+    assert len(xattn.last_args) == 7
     assert xattn.last_args[4] is inputs["text_attention_mask"]
     assert xattn.last_args[5] is inputs["policy_latents"]
+    assert xattn.last_args[6] is None
 
 
 def test_pseudotoken_layers_default_to_xattn_layers():
@@ -243,6 +245,30 @@ def test_structured_square_mixer_requires_square_aligned_inputs(missing_field: s
             inputs["csmp_square_tokens"],
             text_attention_mask=inputs["text_attention_mask"],
             policy_latents=inputs["policy_latents"],
+        )    
+
+
+def test_structured_square_mixer_engineered_source_requires_engineered_features():
+    inputs = _make_inputs()
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        use_engineered_source=True,
+    )
+
+    with pytest.raises(ValueError, match="requires engineered_square_features"):
+        xattn(
+            inputs["hidden_states"],
+            inputs["perceiver_latents"],
+            inputs["context"],
+            inputs["csmp_square_tokens"],
+            text_attention_mask=inputs["text_attention_mask"],
+            policy_latents=inputs["policy_latents"],
+            engineered_square_features=None,
         )
 
 
@@ -286,6 +312,59 @@ def test_structured_square_mixer_metrics_have_expected_shapes_and_normalization(
     torch.testing.assert_close(metrics["global_mean"].sum(), torch.tensor(1.0), atol=1e-5, rtol=0.0)
     torch.testing.assert_close(metrics["effective_gate_abs_mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
     torch.testing.assert_close(metrics["token_gate_logit_mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+
+
+def test_structured_square_mixer_engineered_source_metrics_and_trace_shapes():
+    inputs = _make_inputs(batch_size=2, seq_len=4)
+    xattn = GatedCrossAttention(
+        llm_dim=16,
+        perceiver_dim=8,
+        context_dim=6,
+        n_heads=4,
+        recurrent_query_state_dim=8,
+        xattn_mode="structured_square_mixer",
+        structured_router_mode="per_head",
+        use_engineered_source=True,
+    )
+    xattn.eval()
+    xattn.set_last_token_trace_capture(True)
+
+    outputs = xattn(
+        inputs["hidden_states"],
+        inputs["perceiver_latents"],
+        inputs["context"],
+        inputs["csmp_square_tokens"],
+        text_attention_mask=inputs["text_attention_mask"][:, :4],
+        policy_latents=inputs["policy_latents"],
+        engineered_square_features=inputs["engineered_square_features"],
+    )
+
+    assert outputs.shape == inputs["hidden_states"].shape
+    metrics = xattn._last_structured_metrics
+    assert metrics is not None
+    assert metrics["slot_mean"].shape == (256,)
+    assert metrics["slot_mean_per_head"].shape == (4, 256)
+    assert metrics["source_mass"].shape == (4,)
+    assert metrics["source_mass_per_head"].shape == (4, 4)
+    trace = xattn._last_token_trace
+    assert trace is not None
+    assert trace["source_labels"] == ("csmp", "perceiver", "policy", "engineered")
+    assert trace["source_square_weights"].shape == (2, 4, 64)
+    assert trace["source_square_weights_per_head"].shape == (2, 4, 4, 64)
+    assert trace["source_square_contribution_norms"].shape == (2, 4, 64)
+    assert trace["source_square_contribution_norms_per_head"].shape == (2, 4, 4, 64)
+    torch.testing.assert_close(
+        trace["raw_slot_weights"].sum(dim=-1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        trace["aggregate_square_weights"].sum(dim=-1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=0.0,
+    )
 
 
 def test_structured_square_mixer_last_token_trace_capture_shapes_and_normalization():

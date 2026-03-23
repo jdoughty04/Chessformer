@@ -1,6 +1,6 @@
-# Chess Fusion
+# ChessFormer
 
-Exploring LLM multimodality in the structured domain of chess. Rather than injecting chess tokens into a language model's vocabulary or feeding it high-level engine breakdowns, this project lets the LLM reason about positions directly through a chess position encoder with cross-attention fusion.
+This project explores LLM multimodality in the structured domain of chess. Rather than forcing chess tokens into a language model's prompt or feeding it high-level engine breakdowns, this project lets the LLM reason about positions directly with a chess-specific cross-attention fusion architecture, aiming for natively multimodal, deep chess understanding.
 
 ## Project Goals
 
@@ -10,11 +10,12 @@ Exploring LLM multimodality in the structured domain of chess. Rather than injec
 
 ## Current State
 
-The current model successfully adapts to native multimodal processing of chess positions. Given a board state, it generates commentary that demonstrates high accuracy on state-driven observations:
+Current efforts have aimed to train on low-entropy factoid-style commentary, to achieve native multimodal understanding and set the stage for more sophisticated commentary styles. Given a board state, it generates commentary that demonstrates high accuracy on state-driven observations with few errors:
 
-> *"The black rook on a1 attacks white's knight on c1 and controls the a-file..."*
+> Black's pawn on f6 threatens White's queen on g5. White's pawn on h4 protects White's queen on g5. White has a semi-open f-file. Black's pawn on b6 attacks White's pawn on c5. Black's pawn on a2 puts pressure on White's pawn on b3. White's queen on g5 threatens Black's rook on g6. White's queen on g5 puts pressure on Black's pawn on h4. White's pawn on c5 puts pressure on Black's pawn on d6. Black's knight on b4 puts pressure on White's pawn on d3. Black's pawn on d5 guards Black's pawn on e4. White's pawn on b3 puts pressure on Black's pawn on a4. Black has a semi-open g-file. Black's knight on b4 threatens White's pawn on c2. Black's knight on h7 is on the rim. White's bishop on e2 puts pressure on Black's pawn on d3. Black's rook on g6 is on a semi-open file. Black's pawn on a4 puts pressure on White's pawn on b3. White's queen on g5 guards White's pawn on g3 and White's pawn on h4. Black has a semi-open a-file. Black's knight on h7 protects Black's pawn on f6. Black's knight on b4 protects Black's pawn on a2 and Black's pawn on d5. Black's rook on g6 puts pressure on White's queen on g5. Black's knight on h7 puts pressure on White's queen on g5. White's rook on h3 protects White's pawn on g3 and White's pawn on h4. White's bishop on e2 guards White's pawn on d3. Black's rook on g6 protects Black's pawn on f6. White has a semi-open b-file. White is close to winning. White has a material advantage of significant material. fxg
 
-<!-- TODO: insert demo screenshot / generation sample here -->
+
+![position](position.png)
 
 This lays the foundation for further work toward learning more abstract, human-like commentary styles.
 

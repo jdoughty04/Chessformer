@@ -74,6 +74,20 @@ The active fusion mode is **structured square mixer**. A shared router-condition
 - global-router logits over the Perceiver global latent vs the side-to-move token
 - optional token-conditioned per-head gate logits
 
+Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-aligned source built from the `main` engineered features extracted in `src/training/chess_adapter.py`. Those `204` channels are:
+
+- `64` dims: one-hot square identity
+- `12` dims: piece occupancy by piece type and color
+- `64` dims: attacked-target bitmask for the piece on that square
+- `64` dims: defended-friendly-target bitmask for the piece on that square
+
+In that mode the structured router becomes `64 x 4`, and the inspector exposes an additional `Engineered` board.
+
+This is different from the older `use_engineered_concat` flag, which only
+concatenates those same `204` channels into the Perceiver input once at the
+front of the model. The new router source keeps the engineered features
+available directly at fusion time.
+
 By default (`xattn_structured_router_mode: shared`), one `192`-way square router is shared across all x-attn heads for a token. That is the backward-compatible path and keeps the aggregate inspector view easy to read. With `xattn_structured_router_mode: per_head`, each x-attn head gets its own square/global router so different heads can specialize on different squares or source types.
 
 The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
@@ -83,6 +97,8 @@ The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the mod
 That dynamic gate is intentionally produced from the same router stem as the square/global routing decisions, so "which chess features matter?" and "how much chess should I inject?" are conditioned on the same token state.
 
 The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps one square-aligned representation central to both chess supervision and text generation.
+
+The engineered source is intentionally simpler than the learned CSMP / Perceiver / Policy sources. That makes it useful as a grounding anchor and ablation, but it is still limited: the current features are mostly static occupancy and attack/defense structure. If grounded routing remains weak, the next feature improvements worth testing are attacker/defender counts by side or piece type, pin/check indicators, legal-move participation, ray-blocker structure, pawn-structure flags, and possibly a small separate global engineered token rather than forcing every global fact through square-local channels.
 
 Additional injection mechanisms:
 

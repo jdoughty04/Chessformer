@@ -43,10 +43,20 @@ class StubTokenizer:
         return " ".join(pieces)
 
 
-def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_heads: int = 4):
-    raw_slot_weights = torch.zeros(192, dtype=torch.float32)
+def make_trace(
+    layer_idx: int,
+    slot_index: int,
+    *,
+    per_head: bool = False,
+    num_heads: int = 4,
+    engineered: bool = False,
+):
+    source_labels = ["csmp", "perceiver", "policy"]
+    if engineered:
+        source_labels.append("engineered")
+    raw_slot_weights = torch.zeros(64 * len(source_labels), dtype=torch.float32)
     raw_slot_weights[slot_index] = 1.0
-    source_square_weights = raw_slot_weights.view(3, 64)
+    source_square_weights = raw_slot_weights.view(len(source_labels), 64)
     source_square_contribution_norms = source_square_weights * 0.8
     trace = {
         layer_idx: {
@@ -65,13 +75,19 @@ def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_h
             "perceiver_square_contribution_norms": source_square_contribution_norms[1].clone(),
             "policy_square_contribution_norms": source_square_contribution_norms[2].clone(),
             "router_mode": "shared",
+            "source_labels": source_labels,
             "effective_head_gates": torch.zeros(num_heads, dtype=torch.float32),
             "token_gate_logits": torch.zeros(num_heads, dtype=torch.float32),
         }
     }
+    if engineered:
+        trace[layer_idx]["engineered_square_weights"] = source_square_weights[3].clone()
+        trace[layer_idx]["engineered_square_contribution_norms"] = (
+            source_square_contribution_norms[3].clone()
+        )
     if per_head:
         raw_slot_weights_per_head = torch.stack([raw_slot_weights.roll(shifts=h) for h in range(num_heads)], dim=0)
-        source_square_weights_per_head = raw_slot_weights_per_head.view(num_heads, 3, 64)
+        source_square_weights_per_head = raw_slot_weights_per_head.view(num_heads, len(source_labels), 64)
         source_square_contribution_norms_per_head = []
         global_contribution_norms_per_head = []
         for head_idx in range(num_heads):
@@ -110,6 +126,10 @@ def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_h
         trace[layer_idx]["csmp_square_weights_per_head"] = source_square_weights_per_head[:, 0].clone()
         trace[layer_idx]["perceiver_square_weights_per_head"] = source_square_weights_per_head[:, 1].clone()
         trace[layer_idx]["policy_square_weights_per_head"] = source_square_weights_per_head[:, 2].clone()
+        if engineered:
+            trace[layer_idx]["engineered_square_weights_per_head"] = (
+                source_square_weights_per_head[:, 3].clone()
+            )
         trace[layer_idx]["csmp_square_contribution_norms_per_head"] = (
             source_square_contribution_norms_per_head[:, 0].clone()
         )
@@ -119,6 +139,10 @@ def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_h
         trace[layer_idx]["policy_square_contribution_norms_per_head"] = (
             source_square_contribution_norms_per_head[:, 2].clone()
         )
+        if engineered:
+            trace[layer_idx]["engineered_square_contribution_norms_per_head"] = (
+                source_square_contribution_norms_per_head[:, 3].clone()
+            )
         trace[layer_idx]["csmp_square_contribution_norms"] = (
             trace[layer_idx]["source_square_contribution_norms"][0].clone()
         )
@@ -128,6 +152,10 @@ def make_trace(layer_idx: int, slot_index: int, *, per_head: bool = False, num_h
         trace[layer_idx]["policy_square_contribution_norms"] = (
             trace[layer_idx]["source_square_contribution_norms"][2].clone()
         )
+        if engineered:
+            trace[layer_idx]["engineered_square_contribution_norms"] = (
+                trace[layer_idx]["source_square_contribution_norms"][3].clone()
+            )
         trace[layer_idx]["effective_head_gates"] = torch.linspace(0.1, 0.4, steps=num_heads)
         trace[layer_idx]["token_gate_logits"] = torch.linspace(-0.2, 0.1, steps=num_heads)
     return trace
@@ -385,6 +413,21 @@ def test_decode_session_serializes_per_head_trace_metadata():
     assert len(trace["perceiver_contrib_per_head_64"]) == 4
     assert len(trace["policy_contrib_per_head_64"]) == 4
     assert len(trace["global_contrib_per_head_2"]) == 4
+
+
+def test_decode_session_serializes_engineered_source_trace_metadata():
+    trace_sequence = [make_trace(7, 17, per_head=True, engineered=True)]
+    model = StubModel([[0.1, 0.4, 2.5, 0.3, -0.2, 0.0]], trace_sequence)
+    session = DecodeSession(model)
+
+    snapshot = session.start("8/8/8/8/8/8/8/K6k w - - 0 1", "Inspect this")
+    trace = snapshot["layer_traces"]["7"]
+
+    assert trace["source_labels"] == ["csmp", "perceiver", "policy", "engineered"]
+    assert len(trace["engineered_64"]) == 64
+    assert len(trace["engineered_contrib_64"]) == 64
+    assert len(trace["engineered_per_head_64"]) == 4
+    assert len(trace["engineered_contrib_per_head_64"]) == 4
 
 
 class FakeGenerateLLM:
