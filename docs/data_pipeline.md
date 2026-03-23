@@ -20,7 +20,7 @@ Exported .pt samples
 Training loop
 ```
 
-The [Synthetic Commentary Generation](https://github.com/TODO/synthetic_commentary_generation) repository handles everything up to `.pt` export. This repo consumes those samples.
+The [Synthetic Commentary Generation](https://github.com/jdoughty04/Synthetic_commentary_generation) repository handles everything up to `.pt` export. This repo consumes those samples.
 
 ## Sample Contract
 
