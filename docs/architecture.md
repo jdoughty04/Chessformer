@@ -15,6 +15,10 @@ This approach uses expressive self-attention mechanisms to learn positional prop
 4. Train those latents with chess-native objectives
 5. Fuse chess state into selected LLM decoder layers
 
+<p align="center">
+  <img src="../assets/model_architecture.svg" alt="ChessFormer model architecture diagram" width="980">
+</p>
+
 ## 1. Input Representation
 
 Every position is encoded as an 18-channel `8x8` board tensor (piece placement, side to move, castling rights, en passant). The board-only encoder builds square tokens directly from learned positional and piece embeddings; no pretrained CNN backbone is required.
