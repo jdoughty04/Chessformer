@@ -105,11 +105,13 @@ All objective weights are configurable. Set weight to `0.0` to disable any head.
 | Move-eval regression | `move_eval_mse_weight` | Predict centipawn and mate outputs from the same from/to endpoint scoring |
 | BSR | `bsr_weight` | Reconstruct piece identity per square |
 | SPP | `spp_weight` | Predict attack counts and ray features |
-| Square sparsity | `structured_xattn_sparse_weight` | Keep active decoder square attention focused on few squares |
-| Square diversity | `structured_xattn_square_diversity_weight` | Prevent active square attention collapse to the same squares |
+| Square sparsity | `structured_xattn_sparse_weight` | Make active square-attention heads concentrate on a small number of squares, which usually makes the readout sharper and easier to interpret |
+| Square diversity | `structured_xattn_square_diversity_weight` | Keep the aggregate square usage of active heads from collapsing onto the same few squares everywhere |
 | Gate usage | `structured_xattn_gate_usage_weight` | Keep token-conditioned chess injection from collapsing fully off |
 
 The move-level objectives do not introduce separate move tokens. They reuse the 64 shared policy latents and score Maia's move vocabulary by its `(from_square, to_square)` endpoints.
+
+For intuition, sparsity and diversity act at different levels. Square sparsity is a per-token, per-head pressure: when a structured gate is open, it pushes that head to read from a tighter set of relevant squares instead of spreading weakly over the whole board. Square diversity is an aggregate pressure: across the active heads and tokens in a layer, it discourages the model from repeatedly reusing the same tiny set of squares. So the two objectives are complementary: sparsity makes each individual square read sharper, while diversity reduces global collapse of the whole structured-attention system onto one shared hotspot.
 
 For structured fusion runs, the most important structured-attention controls are usually:
 
