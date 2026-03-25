@@ -7,6 +7,8 @@ transformers>=4.36.0
 peft>=0.7.0
 bitsandbytes>=0.41.0
 accelerate>=0.25.0
+onnx
+onnxruntime-gpu
 
 # Chess
 python-chess>=1.10.0
@@ -22,3 +24,4 @@ tqdm>=4.65.0
 gdown
 pyzstd
 pandas
+

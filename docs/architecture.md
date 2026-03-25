@@ -9,19 +9,16 @@ This approach uses expressive self-attention mechanisms to learn positional prop
 
 ## Pipeline
 
-1. Represent the board as 64 square tokens plus side-to-move context
+1. Represent the board as 64 square tokens plus a token encoding the side to move
 2. Inject explicit chess topology via structure-aware message passing
 3. Compress into structured latents (one per square + one global)
 4. Train those latents with chess-native objectives
 5. Fuse chess state into selected LLM decoder layers
 
-<p align="center">
-  <img src="../assets/model_architecture.svg" alt="ChessFormer model architecture diagram" width="980">
-</p>
 
 ## 1. Input Representation
 
-Every position is encoded as an 18-channel `8x8` board tensor (piece placement, side to move, castling rights, en passant). The board-only encoder builds square tokens directly from learned positional and piece embeddings; no pretrained CNN backbone is required.
+Raw positions enter as 64 square tokens encoding piece type and location, plus a token encoding the side to move. 
 
 Source: `src/training/maia_model.py`
 
@@ -55,21 +52,23 @@ Source: `src/training/chess_structure_mp.py`
 
 Each Perceiver block runs latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent only cross-attends to its corresponding square token from the CSMP, along with the side token. Self attention remains global, and the global latent's cross attention is fully connected. The own-square masking preserves square identity while allowing some global interaction.
 
-A subsequent readout, `_structured_policy_square_readout()`, produces 64 policy latents; also using strict-own-square masking, this is shared between several auxiliary prediction heads.
+A subsequent readout, `_structured_policy_square_readout()`, produces 64 policy latents; also using strict-own-square masking, this square-aligned readout is shared across move supervision, square-wise auxiliary heads, and LLM fusion.
 
 Source: `src/training/chess_fusion_model.py`
 
 ## 4. Auxiliary Chess Heads
 
-The latent space is trained with several chess objectives. All prediction branches share the same 64 policy latents from the Perceiver readout, then specialize via their own `StructuredSquareBranchLayer`.
+The latent space is trained with several chess objectives. All auxiliary heads preserve the square-centric bias: they start from the same 64 policy latents, then either decode moves by pairing projected source/destination squares or predict square-local targets directly.
 
 | Head | What it predicts |
 |------|------------------|
-| **Policy distillation** | Maia move probabilities (1880-move vocabulary, from/to dot product scoring) |
-| **Move-eval ranking** | Soft CE + pairwise ranking over candidate moves |
-| **Move-eval regression** | MSE on centipawn scores + mate classification |
+| **Policy distillation** | Maia move probabilities (1880-move vocabulary; `from_proj` / `to_proj` endpoint scoring) |
+| **Move-eval ranking** | Soft CE + pairwise ranking using the same from/to endpoint scoring |
+| **Move-eval regression** | Centipawn + mate outputs using the same from/to endpoint scoring |
 | **BSR** (Board State Reconstruction) | 13-class per-square piece identity |
 | **SPP** (Square Property Prediction) | 10 numeric channels per square (attack counts, ray distances) |
+
+Each Maia move index is mapped to a `(from_square, to_square)` pair. The move-level heads gather those two square representations after head-specific projections and score the pair with a scaled dot product plus optional move bias. BSR and SPP stay fully square-local. Either way, supervision keeps pushing information back into square-aligned latents instead of introducing a separate move-token representation.
 
 These losses let the adapter learn chess structure even when the LLM is frozen or disabled.
 
@@ -94,9 +93,9 @@ Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-
 In that mode the structured square table becomes $64 \times 4$, and the inspector exposes an additional `Engineered` board.
 
 There is also a strong ablation mode: `engineered_only_xattn_ablation: true`.
-In that configuration, the adapter backbone, CSMP stack, Perceiver, prepended
-latents, pseudotokens, and auxiliary adapter heads are all skipped. Structured
-x-attn is trained against a single square-aligned source:
+In that configuration, the adapter backbone, CSMP stack, Perceiver, and
+auxiliary adapter heads are skipped. Structured x-attn is trained against a
+single square-aligned source:
 
 - `Engineered`
 
@@ -126,14 +125,13 @@ That dynamic gate is produced from the same normalized token state that also
 forms the attention query, so "which chess features matter?" and "how much
 chess should I inject?" stay coupled to the same decoder context.
 
-The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps one square-aligned representation central to both chess supervision and text generation.
+The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps the same square-aligned table central to both chess supervision and text generation: move heads decode from it via endpoint pairing, while the decoder attends to it directly.
 
 The engineered source is intentionally simpler than the learned CSMP / Perceiver / Policy sources. That makes it useful as a grounding anchor and ablation, but it is still limited: the current features are mostly static occupancy and attack/defense structure. If grounded attention remains weak, the next feature improvements worth testing are attacker/defender counts by side or piece type, pin/check indicators, legal-move participation, ray-blocker structure, pawn-structure flags, and possibly a small separate global engineered token rather than forcing every global fact through square-local channels.
 
-Additional injection mechanisms:
+## Optional Regularization
 
-- **Prepended latents**: chess latents projected into the LLM embedding space as prefix tokens
-- **Layer pseudotokens**: per-layer learned KV pairs added to the attention context
+Layer pseudotokens add per-layer learned KV memory, but they are not board-conditioned. The intended use is a brief regularization / adaptation phase while the LLM stays frozen, letting those tokens absorb commentary-style priors so structured x-attn can stay focused on chess content.
 
 For the exact forward equations and regularizer definitions, see [structured_square_mixer_math.md](structured_square_mixer_math.md).
 

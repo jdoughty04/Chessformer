@@ -56,6 +56,8 @@ The layer receives:
 - $g_b^{\mathrm{side}}$: side-to-move / context token
 - $m_{b,t} \in \{0,1\}$: valid-text-token mask
 
+The `pol` source is the same 64-square readout shared with the move-level auxiliary heads. Those heads score Maia's move vocabulary by applying head-specific `from` / `to` projections to this square table and pairing the corresponding endpoints.
+
 All token averages below are taken only over valid text positions:
 
 - $|V| = \sum_{b,t} m_{b,t}$

@@ -160,7 +160,7 @@ The source boards split that aggregate mass by aligned source type:
 
 - `CSMP`: attention to the message-passing square tokens
 - `Perceiver`: attention to the Perceiver square latents
-- `Policy`: attention to the structured policy latents
+- `Policy`: attention to the structured policy latents shared with the move-level policy/eval heads
 - `Engineered` when enabled: attention to the `205`-dim `main` engineered square features
 
 In the engineered-only ablation, this is the only source board because the
@@ -235,7 +235,7 @@ The inspector is the visual counterpart to
 [structured_square_mixer_math.md](structured_square_mixer_math.md):
 
 - top-5 next tokens come from the current decoder logits
-- `CSMP`, `Perceiver`, and `Policy` boards correspond to the three aligned slot groups
+- `CSMP`, `Perceiver`, and `Policy` boards correspond to the three aligned slot groups, with `Policy` showing the shared square latents also used by the move-level heads
 - the optional `Engineered` board corresponds to the engineered-feature slot group
 - `Aggregate` corresponds to the source-marginalized 64-square distribution
 - the head selector lets you switch between the mean-over-heads view and
@@ -247,4 +247,3 @@ The inspector is the visual counterpart to
 
 If you want the exact equations, use the math doc. If you want to see one decode
 step play out visually on a real position, use the inspector.
-

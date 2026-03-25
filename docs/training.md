@@ -47,7 +47,6 @@ chess_fusion:
   freeze_csmp: true
   freeze_perceiver: true
   freeze_xattn: false
-  freeze_prepend_latents: false
 ```
 
 LoRA can also start frozen and unfreeze at a specified epoch:
@@ -101,14 +100,16 @@ All objective weights are configurable. Set weight to `0.0` to disable any head.
 | Objective | Config key | Purpose |
 |-----------|-----------|---------|
 | LM loss | (always on when `enable_lm: true`) | Next-token commentary prediction |
-| Policy distillation | `aux_policy_weight` | Match Maia move probabilities |
-| Move-eval ranking | `aux_move_eval_weight` | Rank candidate moves by engine score |
-| Move-eval regression | `move_eval_mse_weight` | Predict centipawn values |
+| Policy distillation | `aux_policy_weight` | Match Maia move probabilities via shared square latents and from/to endpoint scoring |
+| Move-eval ranking | `aux_move_eval_weight` | Rank candidate moves using the same from/to endpoint scoring |
+| Move-eval regression | `move_eval_mse_weight` | Predict centipawn and mate outputs from the same from/to endpoint scoring |
 | BSR | `bsr_weight` | Reconstruct piece identity per square |
 | SPP | `spp_weight` | Predict attack counts and ray features |
 | Square sparsity | `structured_xattn_sparse_weight` | Keep active decoder square attention focused on few squares |
 | Square diversity | `structured_xattn_square_diversity_weight` | Prevent active square attention collapse to the same squares |
 | Gate usage | `structured_xattn_gate_usage_weight` | Keep token-conditioned chess injection from collapsing fully off |
+
+The move-level objectives do not introduce separate move tokens. They reuse the 64 shared policy latents and score Maia's move vocabulary by its `(from_square, to_square)` endpoints.
 
 For structured fusion runs, the most important structured-attention controls are usually:
 
@@ -116,6 +117,8 @@ For structured fusion runs, the most important structured-attention controls are
 - `xattn_structured_use_engineered_source`: adds a fourth structured square-attention source built from the `main` engineered square features.
 - `engineered_only_xattn_ablation`: removes the backbone / CSMP / Perceiver path and trains structured x-attn against the engineered source alone.
 - `structured_xattn_gate_usage_target`: sets the minimum average `|effective_gate|` encouraged by the weak hinge loss.
+
+LM pseudotokens are optional static learned KV memory. They are best thought of as a brief regularizer for frozen-LLM commentary adaptation, not as grounded board context.
 
 The current `main` engineered source is a `205`-dim per-square vector:
 
@@ -141,8 +144,7 @@ Behavior:
 
 - the only square source is `Engineered`
 - backbone / CSMP / Perceiver forwards are skipped
-- prepended latents are forcibly disabled
-- layer pseudotokens are still allowed by code, but they are static learned KV memory rather than board-conditioned context, so you should disable them for a clean ablation
+- layer pseudotokens are still allowed by code, but they are static learned KV memory used mainly as a brief commentary-domain regularizer rather than board-conditioned context, so you should disable them for a clean ablation
 - adapter auxiliary heads and their losses must be disabled
 - `engineered_features` become required input for training and generation
 
