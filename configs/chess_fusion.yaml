@@ -37,7 +37,7 @@ training:
   prepend_fen_in_prompt: false     # include raw FEN string in the text prompt
   use_pgn_in_prompt: false          # include recent move history
   pgn_prompt_last_n_moves: 5      # how many moves of history to include
-
+  pretrain_engine_outlook_only: false # only use engine outlook in pretraining
   # Chess token weighting: upweight loss on chess-relevant tokens to improve
   # grounding. Set chess_token_weight_enabled: false to use uniform weighting.
   chess_token_weight_enabled: false
@@ -273,8 +273,6 @@ model:
     # --- Freeze / Unfreeze Schedule -------------------------------------------
     # Control which components are trainable. Useful for staged training:
     # e.g., first train encoder with chess objectives, then unfreeze LLM layers.
-    freeze_cnn: true
-    freeze_transformer: true
     freeze_csmp: false
     freeze_perceiver: false
     freeze_xattn: false

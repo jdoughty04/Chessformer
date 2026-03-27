@@ -423,6 +423,7 @@ class TrainingConfig:
     use_pgn_in_prompt: bool = False        # Prepend PGN move list to the text prompt (requires pgn_moves in data)
     prepend_fen_in_prompt: bool = False    # Prepend raw FEN string to the text prompt when available
     pgn_prompt_last_n_moves: Optional[int] = None  # If set, only include last N SAN moves from pgn_moves in prompt
+    pretrain_engine_outlook_only: bool = False     # If true, train only on the structured engine outlook section when present
 
     # Chess token loss weighting: up-weight LM loss on chess-critical tokens
     # (squares, pieces, moves, sides, files) to penalize factual errors more heavily.

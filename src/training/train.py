@@ -2348,6 +2348,9 @@ class ChessCommentaryTrainingDataset(Dataset):
         self.prepend_fen_in_prompt = prepend_fen_in_prompt
         self.pgn_prompt_last_n_moves = pgn_prompt_last_n_moves
         self.reserved_prefix_tokens = int(max(0, reserved_prefix_tokens))
+        self.pretrain_engine_outlook_only = bool(
+            getattr(training_config, "pretrain_engine_outlook_only", False)
+        )
         
         # Find all sample files
         self.sample_files = sorted(self.samples_dir.glob("*.pt"))
@@ -2367,6 +2370,8 @@ class ChessCommentaryTrainingDataset(Dataset):
             print(f"  [PGN context] Limiting prompt PGN to last {pgn_prompt_last_n_moves} SAN moves")
         if self.reserved_prefix_tokens > 0:
             print(f"  [Context budget] Reserving {self.reserved_prefix_tokens} tokens for prepended embeddings")
+        if self.pretrain_engine_outlook_only:
+            print("  [Pretrain supervision] Using only the engine outlook section when structured sections are available")
         if training_config and getattr(training_config, 'chess_token_weight_enabled', False):
             print(f"  [Chess token weights] Enabled — squares={training_config.chess_token_weight_squares:.1f}, "
                   f"pieces={training_config.chess_token_weight_pieces:.1f}, "
@@ -2485,12 +2490,121 @@ class ChessCommentaryTrainingDataset(Dataset):
         parts = re.split(r"(?<=[.!?])\s+", text)
         return [p.strip() for p in parts if p.strip()]
 
+    def _extract_structured_commentary_sections(self, sample: dict[str, Any]) -> list[dict[str, Any]]:
+        metadata = sample.get("metadata")
+        if not isinstance(metadata, dict):
+            return []
+        raw_sections = metadata.get("pretrain_commentary_sections")
+        if not isinstance(raw_sections, list):
+            return []
+
+        sections: list[dict[str, Any]] = []
+        for raw in raw_sections:
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("text", "") or "").strip()
+            if not text:
+                continue
+            try:
+                priority = int(raw.get("priority", 0) or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            sections.append(
+                {
+                    "kind": str(raw.get("kind", "section") or "section"),
+                    "priority": priority,
+                    "protected": bool(raw.get("protected", False)),
+                    "text": text,
+                }
+            )
+        return sections
+
+    def _join_commentary_sections(self, sections: list[dict[str, Any]]) -> str:
+        return "\n\n".join(
+            str(section.get("text", "")).strip()
+            for section in sections
+            if str(section.get("text", "")).strip()
+        ).strip()
+
+    def _select_commentary_for_training(
+        self,
+        commentary: str,
+        sections: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not self.pretrain_engine_outlook_only or not sections:
+            return commentary, sections
+
+        engine_sections = [
+            dict(section)
+            for section in sections
+            if str(section.get("kind", "")).strip() == "engine_eval_top_moves"
+        ]
+        if not engine_sections:
+            return commentary, sections
+
+        return self._join_commentary_sections(engine_sections), engine_sections
+
+    def _fit_structured_commentary_to_budget(
+        self,
+        *,
+        prompt_text: str,
+        sections: list[dict[str, Any]],
+        effective_text_budget: int,
+    ) -> str | None:
+        if not sections:
+            return None
+
+        commentary = self._join_commentary_sections(sections)
+        if commentary and len(self.tokenizer.encode(prompt_text + commentary)) <= effective_text_budget:
+            return commentary
+
+        remaining_sections = [dict(section) for section in sections]
+        droppable = sorted(
+            [section for section in remaining_sections if not bool(section.get("protected", False))],
+            key=lambda section: int(section.get("priority", 0)),
+            reverse=True,
+        )
+        for candidate in droppable:
+            for idx, section in enumerate(remaining_sections):
+                if section is candidate:
+                    remaining_sections.pop(idx)
+                    break
+            commentary = self._join_commentary_sections(remaining_sections)
+            if commentary and len(self.tokenizer.encode(prompt_text + commentary)) <= effective_text_budget:
+                return commentary
+
+        if not remaining_sections:
+            return ""
+
+        protected_indices = [
+            idx for idx, section in enumerate(remaining_sections)
+            if bool(section.get("protected", False))
+        ]
+        for protected_idx in protected_indices:
+            target_text = str(remaining_sections[protected_idx].get("text", "")).strip()
+            sentences = self._split_commentary_sentences(target_text)
+            if not sentences:
+                continue
+
+            for keep_count in range(len(sentences) - 1, 0, -1):
+                trimmed_sections = [dict(section) for section in remaining_sections]
+                trimmed_sections[protected_idx]["text"] = " ".join(sentences[:keep_count]).strip()
+                commentary = self._join_commentary_sections(trimmed_sections)
+                if commentary and len(self.tokenizer.encode(prompt_text + commentary)) <= effective_text_budget:
+                    return commentary
+
+        commentary = self._join_commentary_sections(remaining_sections)
+        if commentary and len(self.tokenizer.encode(prompt_text + commentary)) <= effective_text_budget:
+            return commentary
+        return None
+
     def _fit_commentary_to_budget(
         self,
         prompt_text: str,
         commentary: str,
         effective_text_budget: int,
         idx: int,
+        commentary_sections: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         prompt_token_len = len(self.tokenizer.encode(prompt_text))
         if prompt_token_len > effective_text_budget:
@@ -2503,6 +2617,14 @@ class ChessCommentaryTrainingDataset(Dataset):
         full_text = prompt_text + commentary
         if len(self.tokenizer.encode(full_text)) <= effective_text_budget:
             return commentary
+
+        fitted_structured = self._fit_structured_commentary_to_budget(
+            prompt_text=prompt_text,
+            sections=commentary_sections or [],
+            effective_text_budget=effective_text_budget,
+        )
+        if fitted_structured is not None and len(self.tokenizer.encode(prompt_text + fitted_structured)) <= effective_text_budget:
+            return fitted_structured
 
         sentences = self._split_commentary_sentences(commentary)
         trimmed_commentary = ""
@@ -2643,21 +2765,39 @@ class ChessCommentaryTrainingDataset(Dataset):
             )
 
         original_commentary = sample["commentary"]
+        commentary_sections = self._extract_structured_commentary_sections(sample)
+        selected_commentary, selected_sections = self._select_commentary_for_training(
+            original_commentary,
+            commentary_sections,
+        )
         fitted_commentary = self._fit_commentary_to_budget(
             prompt_text=prompt_text,
-            commentary=original_commentary,
+            commentary=selected_commentary,
             effective_text_budget=effective_text_budget,
             idx=idx,
+            commentary_sections=selected_sections,
         )
         if fitted_commentary != original_commentary:
             if not hasattr(self, '_truncation_warned'):
                 self._truncation_warned = 0
             self._truncation_warned += 1
+            selected_only_engine = selected_commentary != original_commentary
             if self._truncation_warned <= 5:
-                print(
-                    f"  [TRUNCATION] Sample {idx}: trimmed earliest commentary sentence(s) "
-                    f"to preserve prompt/PGN context within {effective_text_budget} tokens"
-                )
+                if fitted_commentary == selected_commentary and selected_only_engine:
+                    print(
+                        f"  [TRUNCATION] Sample {idx}: training on only the engine outlook section "
+                        f"within {effective_text_budget} tokens"
+                    )
+                elif selected_only_engine:
+                    print(
+                        f"  [TRUNCATION] Sample {idx}: using only the engine outlook section and trimming "
+                        f"to fit within {effective_text_budget} tokens"
+                    )
+                else:
+                    print(
+                        f"  [TRUNCATION] Sample {idx}: trimmed earliest commentary sentence(s) "
+                        f"to preserve prompt/PGN context within {effective_text_budget} tokens"
+                    )
             elif self._truncation_warned == 6:
                 print("  [TRUNCATION] Suppressing further warnings...")
 

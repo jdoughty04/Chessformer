@@ -1,42 +1,54 @@
 # Architecture
 
-While the best performing neural chess engines traditionally use full 64x64 attention mechanisms (and often CNN stems), specializing the architecture is a promising approach. This paper [Enhancing Chess Reinforcement Learning with Graph Representations](https://arxiv.org/pdf/2410.23753) found that sparse, relation-specific attention mechanisms have higher learning affinity in lower-compute training regimes.
+## Design Philosophy
+Language models are notouriously bad at chess. Evidently, causal langauge modeling does not naturally encode the intricate geometric relationships that are fundamental to chess. To adapt LLMs for chess, they need a specialized architecture. Similar to how CNN encoders enable visual data to be processed by an LLM, we need a chess position encoder to encode the board state in a way that is meaningful to the model.
 
-This approach uses expressive self-attention mechanisms to learn positional properties, but structurally enforces biases toward square-level representations so that squares encode information and relationships that are directly related to them. The idea is that keeping square-level representations:
-- Naturally adheres to a useful inductive bias for chess, potentially improving optimization and transferability
-- Allows for better mechanistic interpretability and debugging as we can probe how the model processes information at the square level
--
+
+The best-performing neural chess engines traditionally use dense 64×64 attention or convolutional stems, learning chess structure implicitly from data. While these architectures are effective at scale, they function as black boxes which don't provide mechanisms to enforce strong square-level intermediate representations that align with meaningful chess concepts. They also require the model to discover well-known geometric relationships from scratch.
+
+This project enforces chess structure directly through two strategies:
+
+1. **Sparse relation-specific attention masks** dedicate early attention layers to route information along chess-meaningful paths (files, ranks, diagonals, knight hops, attack rays), so the model operates on the board's actual geometry rather than learning to approximate it.
+2. **Square-aligned information bottlenecks** ensure that each latent representation corresponds to a specific board square, creating representations where each square encodes information directly relevant to it.
+
+Together, these produce an architecture with key properties:
+
+- **Chess-native inductive bias.** The model doesn't learn chess topology from scratch—it's encoded structurally. This improves optimization efficiency, particularly in low-compute regimes.
+- **Mechanistic interpretability.** Square-aligned latents allow direct inspection of what squares the model focuses on and how information routes through the architecture.
+- **Transferability.** Strong representation learning enables easier adaptation to commentary generation in LLM fusion. 
 
 ## Pipeline
 
-1. Represent the board as 64 square tokens plus a token encoding the side to move
-2. Inject explicit chess topology via structure-aware message passing
-3. Compress into structured latents (one per square + one global)
-4. Train those latents with chess-native objectives
-5. Fuse chess state into selected LLM decoder layers
+![pipeline overview](../assets/pipeline_overview.png)
 
+[View diagram: Architecture Pipeline Overview](https://www.figma.com/online-whiteboard/create-diagram/4a1e1fdb-385d-447b-a1b6-c518fff363fe?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=6a7bac6e-3c19-4634-855f-b2c4e44b835f)
 
-## 1. Input Representation
+## 1. Chess Square Message Passing (CSMP)
 
-Raw positions enter as 64 square tokens encoding piece type and location, plus a token encoding the side to move. 
+Raw positions enter as **64 square embeddings**, each encoding piece type and position. CSMP processes only these 64 square tokens through its relational attention heads. A side-to-move token is added to the output context after CSMP processing.
 
-Source: `src/training/maia_model.py`
+`ChessStructureMP` runs multi-layer sparse attention where **each attention head operates over a distinct chess relation**, acting as a dedicated information channel for that geometric relationship:
 
-## 2. Chess Structure Message Passing (CSMP)
+![diagram1](../assets/diagram1.png)
 
-`ChessStructureMP` runs sparse multi-head attention over the 64 square tokens. Each attention head is assigned to a chess-specific relation:
+[View diagram: CSMP Chess Relational Attention](https://www.figma.com/online-whiteboard/create-diagram/e49af47d-679c-47c2-8a29-49034970b450?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=fb00454a-87e2-48d1-a1a2-45497355a0e2)
 
-- Same file / rank / diagonal / anti-diagonal
-- Knight connectivity
-- King-neighborhood connectivity
-- Dynamic sliding rays (based on occupancy)
-- Dynamic attack relations (based on piece type and blockers)
+| Head | Relation | What it connects |
+|------|----------|-----------------|
+| 0 | File | Squares sharing a column |
+| 1 | Rank | Squares sharing a row |
+| 2 | Diagonal | NW–SE aligned squares |
+| 3 | Anti-diagonal | NE–SW aligned squares |
+| 4 | Knight | L-shaped hops (up to 8 targets + self) |
+| 5 | King | 8-adjacent neighborhood + self |
+| 6 | Sliding rays | Unobstructed paths (dynamic per position) |
+| 7 | Attacks | Piece-specific attack patterns (dynamic per position) |
 
-This gives the model a board graph that encodes legal geometry before the Perceiver layers start compressing.
+Heads 0–5 use static masks derived from board geometry. Heads 6–7 compute masks dynamically based on piece placement and occupancy, capturing the position-dependent nature of sliding-piece attacks and ray connectivity.
 
 ### Relative Position Modes
 
-CSMP supports three modes for optional relative position encoding schemes that influence how square pairs interact:
+CSMP supports three modes for optional relative position encoding that influence how square pairs interact within each relation:
 
 | Mode | Behavior |
 |------|----------|
@@ -46,96 +58,129 @@ CSMP supports three modes for optional relative position encoding schemes that i
 
 Source: `src/training/chess_structure_mp.py`
 
-## 3. Structured Perceiver Latents
+## 2. Structured Perceiver Latents
 
-`SquareLatentEncoder` is a Perceiver-style bottleneck with **65 structured latents**: 64 square-aligned plus 1 global.
+`SquareLatentEncoder` maintains **64 learned square latents plus 1 learned global latent** that read from the CSMP context via cross-attention.
 
-Each Perceiver block runs latent self-attention, cross-attention to the chess context, and an FFN update. With `strict_own_square` masking, each square latent only cross-attends to its corresponding square token from the CSMP, along with the side token. Self attention remains global, and the global latent's cross attention is fully connected. The own-square masking preserves square identity while allowing some global interaction.
+Each perceiver block applies three operations in sequence:
 
-A subsequent readout, `_structured_policy_square_readout()`, produces 64 policy latents; also using strict-own-square masking, this square-aligned readout is shared across move supervision, square-wise auxiliary heads, and LLM fusion.
+1. **Full self-attention** among all 65 latents. Every square can exchange information with every other square and the global latent, enabling board-wide reasoning.
+2. **Strict own-square cross-attention** to the assembled context (CSMP square outputs + side-to-move token). Each square latent attends *only* to its corresponding CSMP square token (plus optionally the side-to-move token, which was added after CSMP processing). The global latent attends to all context tokens.
+3. **FFN** per-latent feedforward update.
+
+
+![diagram2](../assets/diagram2.png)
+[View diagram: Strict Own-Square Cross-Attention](https://www.figma.com/online-whiteboard/create-diagram/7ed87d6c-9cf5-4bc8-aa1d-b8516256b035?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=d97876e6-8447-444d-9ab4-e59f35c25682)
+
+The strict own-square masking is the core mechanism that enforces square-level representations: each latent can only absorb local information through cross-attention, while broader context must route through self-attention with other latents. This creates an information bottleneck that preserves sharp square identity throughout the pipeline. The same masking pattern is reused in the policy readout's cross-attention, maintaining consistent square alignment from encoding through prediction.
+
+All 64 square latents are initialized from a single shared base vector, expanded identically across positions. 
 
 Source: `src/training/chess_fusion_model.py`
 
-## 4. Auxiliary Chess Heads
+## 3. Policy & Auxiliary Readout
 
-The latent space is trained with several chess objectives. All auxiliary heads preserve the square-centric bias: they start from the same 64 policy latents, then either decode moves by pairing projected source/destination squares or predict square-local targets directly.
+### Branching Architecture
 
-| Head | What it predicts |
-|------|------------------|
-| **Policy distillation** | Maia move probabilities (1880-move vocabulary; `from_proj` / `to_proj` endpoint scoring) |
-| **Move-eval ranking** | Soft CE + pairwise ranking using the same from/to endpoint scoring |
-| **Move-eval regression** | Centipawn + mate outputs using the same from/to endpoint scoring |
-| **BSR** (Board State Reconstruction) | 13-class per-square piece identity |
-| **SPP** (Square Property Prediction) | 10 numeric channels per square (attack counts, ray distances) |
+The perceiver's 65 latents feed two levels of task-specific branching:
 
-Each Maia move index is mapped to a `(from_square, to_square)` pair. The move-level heads gather those two square representations after head-specific projections and score the pair with a scaled dot product plus optional move bias. BSR and SPP stay fully square-local. Either way, supervision keeps pushing information back into square-aligned latents instead of introducing a separate move-token representation.
+![Move Prediction via Square Endpoint Scoring](../assets/diagram3.png)
 
-These losses let the adapter learn chess structure even when the LLM is frozen or disabled.
+[View diagram: Policy & Auxiliary Readout Branching](https://www.figma.com/online-whiteboard/create-diagram/3ddaa27b-35d9-4dfe-b16a-93ab86eb61da?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=f02bf49a-a8bc-45ad-9270-bf0b97e64be9)
 
-## 5. LLM Fusion
+**Level 1 — From Perceiver:**
+- 64 square latents → **Policy Readout** (`_structured_policy_square_readout`): additional cross-attention and self-attention layers refine square representations for move prediction
+- 64 square latents → **BSR** (Board State Reconstruction): 13-class per-square piece identity
+- 64 square latents → **SPP** (Square Property Prediction): 10 numeric channels per square (attack counts, ray distances)
 
-Selected decoder layers are wrapped with `FusionDecoderLayer`, which injects chess context via gated cross-attention.
+**Level 2 — From Policy Readout:**
+Each move-prediction task gets its own branch layer (`StructuredSquareBranchLayer`) with dedicated cross-attention and self-attention:
+- **Policy distillation**: Maia move probabilities (1880-move vocabulary)
+- **Move-eval ranking**: Soft CE + pairwise ranking
+- **Move-eval regression**: Centipawn + mate prediction
 
-The active structured fusion mode is `structured_cross_attn`. Each selected decoder layer forms text queries from
-`LayerNorm(hidden_states) -> q_proj`, then runs two per-head attention branches:
+### Move Prediction via Square Endpoint Scoring
 
-- square attention over $64 \times 3$ aligned slots (CSMP, Perceiver, Policy per square)
-- global attention over the Perceiver global latent vs the side-to-move token
-- optional token-conditioned per-head gate logits from the same normalized token states
+Rather than maintaining a separate move-token vocabulary, all move heads score candidates by pairing **source and destination square representations**:
+![Move prediction scoring](../assets/diagram4.png)
+[View diagram: Move Prediction via Square Endpoint Scoring](https://www.figma.com/online-whiteboard/create-diagram/4e05093a-16ba-4f62-90d1-16a796c6d4db?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=e3b8fcd2-83dc-4df6-af7a-ef7094ce8570)
 
-Optionally, `xattn_structured_use_engineered_source: true` adds a fourth square-aligned source built from the `main` engineered features extracted in `src/training/chess_adapter.py`. Those `205` channels are:
-
-- `64` dims: one-hot square identity
-- `13` dims: piece occupancy by piece type/color plus an explicit empty-square channel
-- `64` dims: attacked-target bitmask for the piece on that square
-- `64` dims: defended-friendly-target bitmask for the piece on that square
-
-In that mode the structured square table becomes $64 \times 4$, and the inspector exposes an additional `Engineered` board.
-
-There is also a strong ablation mode: `engineered_only_xattn_ablation: true`.
-In that configuration, the adapter backbone, CSMP stack, Perceiver, and
-auxiliary adapter heads are skipped. Structured x-attn is trained against a
-single square-aligned source:
-
-- `Engineered`
-
-The fusion layer still receives a global conditioning vector and a side/context
-token, but in this ablation they are deterministic summaries derived directly
-from the engineered features plus side-to-move rather than learned adapter
-latents. That keeps the experiment focused on whether x-attn alone can learn to
-route grounded square-local engineered features into the LLM.
-
-With the structured source enabled, those same `205` channels stay directly
-available at fusion time instead of being used only at the front of the model.
-
-Runtime structured fusion uses per-head attention. The inspector can show
-either individual heads or aggregate views by averaging or gate-weighting the
-per-head attention maps.
-
-The token-conditioned gate path (`xattn_text_gate_mode: tanh_head`) lets the model reduce chess injection on a token-by-token basis instead of relying only on the static learned head gates. In structured mode the effective injection gate is:
+1. The 64 policy latents are projected into separate **from-space** and **to-space** via learned projections (`from_proj`, `to_proj`).
+2. For each candidate move in the 1880-move Maia vocabulary, the model gathers the from-square and to-square representations.
+3. The move logit is the **scaled dot product** of the two endpoints:
 
 $$
-\tanh(g_h^{\mathrm{static}} + \ell_{b,t,h})
+\text{logit}(m) = \frac{\mathbf{f}_{s(m)} \cdot \mathbf{t}_{d(m)}}{\sqrt{d}} + b_m
 $$
 
-where $g_h^{\mathrm{static}}$ is the learned per-head static gate and
-$\ell_{b,t,h}$ is the token-conditioned gate logit.
+where $s(m)$ and $d(m)$ are the source and destination squares, and $b_m$ is an optional per-move bias.
 
-That dynamic gate is produced from the same normalized token state that also
-forms the attention query, so "which chess features matter?" and "how much
-chess should I inject?" stay coupled to the same decoder context.
+Each of these auxiliary tasks are grounded in square-level predictions. Supervision flows back into square-aligned latents incentivizing structured representations over highly entangled ones.
 
-The LLM reads the shared policy latents and generic Perceiver/CSMP sources, not the branch-specific prediction heads. This keeps the same square-aligned table central to both chess supervision and text generation: move heads decode from it via endpoint pairing, while the decoder attends to it directly.
+Source: `src/training/chess_fusion_model.py`
 
-The engineered source is intentionally simpler than the learned CSMP / Perceiver / Policy sources. That makes it useful as a grounding anchor and ablation, but it is still limited: the current features are mostly static occupancy and attack/defense structure. If grounded attention remains weak, the next feature improvements worth testing are attacker/defender counts by side or piece type, pin/check indicators, legal-move participation, ray-blocker structure, pawn-structure flags, and possibly a small separate global engineered token rather than forcing every global fact through square-local channels.
+## 4. LLM Gated Cross-Attention
+
+Selected decoder layers are wrapped with `FusionDecoderLayer`, injecting chess context via **per-head gated structured cross-attention** with two parallel branches.
+
+![LLM Gated Cross-Attention Fusion](../assets/diagram5.png)
+
+[View diagram: LLM Gated Cross-Attention Fusion](https://www.figma.com/online-whiteboard/create-diagram/da4e5d77-4943-48a1-9cb6-ee24c9ff7f49?utm_source=other&utm_content=edit_in_figjam&oai_id=&request_id=35efa308-7d44-4c14-8efb-a5bb680652c4)
+
+### Square Branch
+
+A structured table of **64 × N<sub>src</sub> square-aligned slots** is assembled from multiple sources, each projected through a dedicated MLP:
+
+| Source | Content |
+|--------|---------|
+| CSMP | Low-level relational features per square |
+| Perceiver | Compressed square latents |
+| Policy | Task-refined square representations |
+| Engineered (optional) | 205-dim grounded features: square identity, piece occupancy, attack/defense bitmasks |
+
+Each LLM token forms a query from its hidden state, attends over the full 64 × N<sub>src</sub> square table via per-head attention, and produces a square message.
+
+### Global Branch
+
+A separate 2-token branch provides position-level context:
+- Perceiver global latent
+- Side-to-move token
+
+### Token-Conditioned Gating
+
+The effective injection gate combines a static learned per-head component with a dynamic token-conditioned component:
+
+$$
+g_{\text{eff}}[b,t,h] = \tanh\!\bigl(g_h^{\text{static}} + \ell_{b,t,h}\bigr)
+$$
+
+where $\ell_{b,t,h}$ is produced from the same normalized hidden state that forms the attention query. This couples "which chess features matter" with "how much chess to inject" within the same decoder context. The output is:
+
+$$
+h'_t = h_t + g_{\text{eff}} \cdot W_o\!\bigl[\text{M}_{\text{sq}} + \text{M}_{\text{glb}}\bigr]
+$$
+
+followed by a gated FFN residual.
+
+The LLM reads the shared policy latents and CSMP/Perceiver sources directly—not the branch-specific prediction heads. This keeps the same square-aligned representations central to both chess supervision and text generation.
+
+### Engineered Feature Ablation
+
+An ablation mode (`engineered_only_xattn_ablation`) bypasses the learned CSMP/Perceiver pipeline entirely, feeding only the 205-dim engineered features into structured cross-attention. This isolates whether the cross-attention mechanism alone can route grounded square-local features into the LLM, independent of the learned adapter.
+
+Source: `src/training/chess_fusion_model.py`
 
 ## Optional Regularization
 
-Layer pseudotokens add per-layer learned KV memory, but they are not board-conditioned. The intended use is a brief regularization / adaptation phase while the LLM stays frozen, letting those tokens absorb commentary-style priors so structured x-attn can stay focused on chess content.
+Three structured regularizers keep the cross-attention path well-behaved:
 
-For the exact forward equations and regularizer definitions, see [structured_square_mixer_math.md](structured_square_mixer_math.md).
+- **Sparse square-attention**: Encourages focused attention over squares (gate-weighted entropy)
+- **Square diversity**: Prevents collapse to a few favored squares (minimum usage entropy threshold)
+- **Gate usage**: Keeps the structured path active when useful (minimum gate activation threshold)
 
-Source: `src/training/chess_fusion_model.py`
+Layer pseudotokens add per-layer learned KV memory, but are not board-conditioned. Their intended use is regularization/adaptation while the LLM stays frozen, letting those tokens absorb commentary-style priors so structured cross-attention can stay focused on chess content.
+
+For exact forward equations and regularizer definitions, see [structured_square_mixer_math.md](structured_square_mixer_math.md).
 
 ## Supported LLM Backends
 
