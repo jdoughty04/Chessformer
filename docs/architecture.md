@@ -1,8 +1,7 @@
 # Architecture
 
 ## Design Philosophy
-Language models are notouriously bad at chess. Evidently, causal langauge modeling does not naturally encode the intricate geometric relationships that are fundamental to chess. To adapt LLMs for chess, they need a specialized architecture. Similar to how CNN encoders enable visual data to be processed by an LLM, we need a chess position encoder to encode the board state in a way that is meaningful to the model.
-
+Language models are notouriously bad at chess. Evidently, causal langauge modeling does not naturally encode the intricate geometric relationships that are fundamental to chess. To adapt LLMs for chess, they need a specialized adapter. Similar to CNN encoders that enable LLMs to process visual data, we need a chess position encoder to encode the board state in a way that is meaningful to the model.
 
 The best-performing neural chess engines traditionally use dense 64×64 attention or convolutional stems, learning chess structure implicitly from data. While these architectures are effective at scale, they function as black boxes which don't provide mechanisms to enforce strong square-level intermediate representations that align with meaningful chess concepts. They also require the model to discover well-known geometric relationships from scratch.
 
